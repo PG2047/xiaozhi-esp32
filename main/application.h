@@ -111,6 +111,11 @@ public:
 
     void Reboot();
     void WakeWordInvoke(const std::string& wake_word);
+#if CONFIG_AI_PASSPORT_TEST_CONSOLE
+    // Development test console only: sends text to the server as if it had been said,
+    // inside the conversation that is open (WakeWordInvoke() would end it instead).
+    void SendTestText(const std::string& text);
+#endif
     bool UpgradeFirmware(const std::string& url, const std::string& version = "");
     bool CanEnterSleepMode();
     void SendMcpMessage(const std::string& payload);

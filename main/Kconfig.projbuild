@@ -950,6 +950,16 @@ config JC4827W543_EXTERNAL_AMP
         what a stock unit uses. Enable this only if you drive an external I2S
         amplifier from the expansion headers instead.
 
+config AI_PASSPORT_TEST_CONSOLE
+    bool "FoloToy AI Passport: USB serial test console (development builds only)"
+    depends on BOARD_TYPE_FOLOTOY_AI_PASSPORT
+    default n
+    help
+        Starts a console on the USB Serial/JTAG port with `tc` commands that drive
+        the device without touching it: start a conversation from text, press keys,
+        set the volume and print the screen state. Used for automated hardware
+        tests; leave it off in builds for everyday use.
+
 config USE_MULTILINE_CHAT_MESSAGE
     bool "Use multiline chat message display (default mode only)"
     depends on USE_DEFAULT_MESSAGE_STYLE

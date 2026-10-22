@@ -25,6 +25,7 @@
 #include <material_symbols.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <initializer_list>
 #include <iterator>
@@ -833,5 +834,125 @@ void LcdDisplay::UpdateMoreBelow() {
         lv_obj_add_flag(more_below_label_, LV_OBJ_FLAG_HIDDEN);
     }
 }
+
+#if CONFIG_AI_PASSPORT_TEST_CONSOLE
+namespace {
+
+void AppendJsonString(std::string& out, const std::string& text) {
+    out += '"';
+    for (char c : text) {
+        if (c == '"' || c == '\\') {
+            out += '\\';
+            out += c;
+        } else if (static_cast<unsigned char>(c) < 0x20) {
+            out += ' ';
+        } else {
+            out += c;
+        }
+    }
+    out += '"';
+}
+
+// The first (from_end == false) or last `chars` characters of a UTF-8 string.
+std::string Utf8Slice(const std::string& text, size_t chars, bool from_end) {
+    const size_t total = Utf8Length(text);
+    if (total <= chars) {
+        return text;
+    }
+    const size_t skip = from_end ? total - chars : 0;
+    const size_t keep = chars;
+    std::string out;
+    size_t index = 0;
+    for (size_t i = 0; i < text.size(); ++i) {
+        const bool lead = (static_cast<unsigned char>(text[i]) & 0xC0) != 0x80;
+        if (lead && i > 0) {
+            ++index;
+        }
+        if (index >= skip && index < skip + keep) {
+            out += text[i];
+        }
+    }
+    return out;
+}
+
+std::string HexColor(lv_color_t color) {
+    char buffer[8];
+    snprintf(buffer, sizeof(buffer), "#%02X%02X%02X", color.red, color.green, color.blue);
+    return buffer;
+}
+
+const char* Bool(bool value) { return value ? "true" : "false"; }
+
+}  // namespace
+
+std::string LcdDisplay::DescribeReadingState() {
+    DisplayLockGuard lock(this);
+    if (content_ == nullptr) {
+        return "{}";
+    }
+    lv_obj_update_layout(content_);
+    const int32_t scroll = lv_obj_get_scroll_y(content_);
+    std::string out = "{\"scroll\":" + std::to_string(scroll);
+    out += ",\"max_scroll\":" + std::to_string(scroll + lv_obj_get_scroll_bottom(content_));
+    out += ",\"page\":" + std::to_string(lv_obj_get_content_height(content_));
+    out += ",\"follow\":";
+    out += Bool(follow_latest_);
+    out += ",\"ended\":";
+    out += Bool(conversation_ended_);
+    out += ",\"more_below\":";
+    out += Bool(!lv_obj_has_flag(more_below_label_, LV_OBJ_FLAG_HIDDEN));
+    out += ",\"pending\":" + std::to_string(static_cast<int>(pending_));
+    out += ",\"pending_text\":";
+    AppendJsonString(out, lv_obj_has_flag(pending_label_, LV_OBJ_FLAG_HIDDEN)
+                              ? ""
+                              : lv_label_get_text(pending_label_));
+    out += ",\"status\":";
+    AppendJsonString(out, lv_label_get_text(status_label_));
+    out += ",\"notification\":";
+    AppendJsonString(out, lv_obj_has_flag(notification_label_, LV_OBJ_FLAG_HIDDEN)
+                              ? ""
+                              : lv_label_get_text(notification_label_));
+    out += ",\"tint\":\"" + HexColor(lv_obj_get_style_bg_color(top_bar_, LV_PART_MAIN)) + "\"";
+    out += ",\"system\":";
+    AppendJsonString(out, lv_obj_has_flag(system_label_, LV_OBJ_FLAG_HIDDEN)
+                              ? ""
+                              : lv_label_get_text(system_label_));
+    out += ",\"rate\":" + std::to_string(speech_.rate_scale());
+    out += ",\"turns\":[";
+    const auto& turns = transcript_.turns();
+    for (size_t i = 0; i < turns.size(); ++i) {
+        const auto& turn = turns[i];
+        const std::string answer = turn.AssistantText();
+        const size_t chars = Utf8Length(answer);
+        const bool newest = i + 1 == turns.size();
+        if (i > 0) {
+            out += ',';
+        }
+        out += "{\"user\":";
+        AppendJsonString(out, turn.user);
+        out += ",\"chars\":" + std::to_string(chars);
+        out += ",\"sentences\":" + std::to_string(turn.sentences.size());
+        out += ",\"head\":";
+        AppendJsonString(out, Utf8Slice(answer, 16, false));
+        out += ",\"tail\":";
+        AppendJsonString(out, Utf8Slice(answer, 12, true));
+        out += ",\"lit\":" + std::to_string(newest ? speech_.LitChars(turn) : chars);
+        out += ",\"trimmed\":";
+        out += Bool(turn.trimmed);
+        if (const ReadingTurnView* view = FindTurnView(turn.id)) {
+            out += ",\"sel\":[" +
+                   std::to_string(lv_label_get_text_selection_start(view->assistant)) + "," +
+                   std::to_string(lv_label_get_text_selection_end(view->assistant)) + "]";
+            out += ",\"y\":" + std::to_string(lv_obj_get_y(view->box));
+            out += ",\"h\":" + std::to_string(lv_obj_get_height(view->box));
+            out += ",\"color\":\"" +
+                   HexColor(lv_obj_get_style_text_color(view->assistant, LV_PART_MAIN)) + "\"";
+        }
+        out += '}';
+    }
+    out += "]}";
+    return out;
+}
+#endif  // CONFIG_AI_PASSPORT_TEST_CONSOLE
 
 #endif  // CONFIG_USE_READING_MESSAGE_STYLE

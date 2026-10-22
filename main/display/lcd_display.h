@@ -131,6 +131,10 @@ public:
     virtual void SetSpeechProgress(uint32_t speech_id, uint32_t position_ms) override;
     virtual void OnSpeechInterrupted() override;
     virtual bool SetSpeechFollowWords(bool words) override;
+#if CONFIG_AI_PASSPORT_TEST_CONSOLE
+    // One-line JSON description of the reading layout, for automated hardware tests.
+    std::string DescribeReadingState();
+#endif
 #endif
 };
 

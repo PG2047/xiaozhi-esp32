@@ -26,6 +26,15 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
+#if CONFIG_AI_PASSPORT_TEST_CONSOLE
+#include <esp_console.h>
+#include <esp_heap_caps.h>
+
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#endif
+
 #define TAG "AiPassport"
 
 // Physical keys share one ADC pin through a resistor ladder (see config.h).
@@ -1200,6 +1209,137 @@ private:
         AUDIO_CODEC_I2C_SDA_PIN, AUDIO_CODEC_I2C_SCL_PIN,
     };
 
+#if CONFIG_AI_PASSPORT_TEST_CONSOLE
+    // USB serial test console for automated hardware tests (development builds only):
+    //   tc ask <text>                start a conversation from text instead of speech
+    //   tc say <text>                say <text> inside the open conversation
+    //   tc askx / sayx <hex>         the same with UTF-8 text in hex (non-ASCII text)
+    //   tc toggle | tc key ok        the OK key
+    //   tc key up|down [hold <ms>]   click UP/DOWN, or hold it for <ms>
+    //   tc volume <0-100>            set the volume
+    //   tc subtitle words|sentences  how the spoken answer is lit
+    //   tc wifi off|on               stop or restart the Wi-Fi station
+    //   tc state                     print one line: READING {...}
+    void InitializeTestConsole() {
+        esp_console_repl_t* repl = nullptr;
+        esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
+        repl_config.prompt = "tc>";
+        repl_config.max_history_len = 4;
+        repl_config.max_cmdline_length = 512;
+        repl_config.task_stack_size = 6144;
+        if (esp_console_new_repl_stdio(&repl_config, &repl) != ESP_OK) {
+            ESP_LOGE(TAG, "Test console not started");
+            return;
+        }
+        esp_console_cmd_t command = {};
+        command.command = "tc";
+        command.help =
+            "Passport test commands: ask, say, toggle, key, volume, subtitle, wifi, state";
+        command.func_w_context = [](void* context, int argc, char** argv) -> int {
+            return static_cast<AiPassportBoard*>(context)->RunTestCommand(argc, argv);
+        };
+        command.context = this;
+        ESP_ERROR_CHECK(esp_console_cmd_register(&command));
+        ESP_ERROR_CHECK(esp_console_start_repl(repl));
+        ESP_LOGW(TAG, "Test console started (development build)");
+    }
+
+    // A console command counts as a key press for the idle stages, so the screen wakes
+    // up and the device does not sleep in the middle of a test.
+    void NoteTestActivity() {
+        last_key_us_ = esp_timer_get_time();
+        RearmIdleStages();
+        WakeUpPowerSaveTimer();
+    }
+
+    // Runs on the console task; anything that touches the UI or the codec is
+    // scheduled onto the main task, the same way the key callbacks do it.
+    int RunTestCommand(int argc, char** argv) {
+        auto& app = Application::GetInstance();
+        const std::string sub = argc > 1 ? argv[1] : "";
+        const bool hex_text = sub == "askx" || sub == "sayx";
+        if (sub == "ask" || sub == "say" || hex_text || sub == "toggle" || sub == "key") {
+            NoteTestActivity();
+        }
+        if ((sub == "ask" || sub == "say" || hex_text) && argc > 2) {
+            // The console line editor drops non-ASCII bytes, so other text comes in as
+            // hex (askx / sayx).
+            std::string text;
+            if (hex_text) {
+                const std::string hex = argv[2];
+                for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+                    text += static_cast<char>(strtol(hex.substr(i, 2).c_str(), nullptr, 16));
+                }
+            } else {
+                for (int i = 2; i < argc; ++i) {
+                    if (i > 2) {
+                        text += ' ';
+                    }
+                    text += argv[i];
+                }
+            }
+            ESP_LOGI(TAG, "tc %s: %s", sub.c_str(), text.c_str());
+            if (sub == "ask" || sub == "askx") {
+                app.WakeWordInvoke(text);
+            } else {
+                app.SendTestText(text);
+            }
+        } else if (sub == "toggle" || (sub == "key" && argc > 2 && std::string(argv[2]) == "ok")) {
+            app.Schedule([this]() {
+                if (ToggleChatNeedsNetwork() && !WifiManager::GetInstance().IsConnected()) {
+                    GetDisplay()->ShowNotification(Lang::Strings::CONNECTING);
+                    return;
+                }
+                ToggleChat();
+            });
+        } else if (sub == "key" && argc > 2) {
+            const std::string key = argv[2];
+            if (key != "up" && key != "down") {
+                printf("tc: unknown key %s\n", key.c_str());
+                return 1;
+            }
+            const int direction = key == "up" ? -1 : 1;
+            if (argc > 4 && std::string(argv[3]) == "hold") {
+                StartVolumeRepeat(direction < 0 ? kVolumeRepeatStep : -kVolumeRepeatStep);
+                vTaskDelay(pdMS_TO_TICKS(atoi(argv[4])));
+                StopVolumeRepeat();
+            } else {
+                app.Schedule([this, direction]() { GetDisplay()->ScrollChat(direction); });
+            }
+        } else if (sub == "volume" && argc > 2) {
+            const int volume = atoi(argv[2]);
+            app.Schedule([this, volume]() { GetAudioCodec()->SetOutputVolume(volume); });
+        } else if (sub == "subtitle" && argc > 2) {
+            GetDisplay()->SetSpeechFollowWords(std::string(argv[2]) == "words");
+        } else if (sub == "wifi" && argc > 2) {
+            if (std::string(argv[2]) == "off") {
+                WifiManager::GetInstance().StopStation();
+            } else {
+                WifiManager::GetInstance().StartStation();
+            }
+        } else if (sub == "state") {
+            app.Schedule([this]() { PrintTestState(); });
+        } else {
+            printf("tc: ask|say|toggle|key|volume|subtitle|wifi|state\n");
+            return 1;
+        }
+        return 0;
+    }
+
+    void PrintTestState() {
+        auto& app = Application::GetInstance();
+        std::string line = "READING {\"state\":" + std::to_string(app.GetDeviceState());
+        line += ",\"volume\":" + std::to_string(GetAudioCodec()->output_volume());
+        line += ",\"free\":" + std::to_string(heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        line += ",\"min\":" + std::to_string(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
+        line += ",\"wifi\":";
+        line += WifiManager::GetInstance().IsConnected() ? "true" : "false";
+        line += ",\"display\":" + display_->DescribeReadingState() + "}";
+        printf("%s\n", line.c_str());
+        fflush(stdout);
+    }
+#endif
+
 public:
     AiPassportBoard() : display_(nullptr), battery_(nullptr) {
         ReleaseDeepSleepHolds();
@@ -1209,6 +1349,9 @@ public:
         InitializeButtons();
         GetBacklight()->RestoreBrightness();
         InitializePowerSaveTimer();
+#if CONFIG_AI_PASSPORT_TEST_CONSOLE
+        InitializeTestConsole();
+#endif
     }
 
     virtual AudioCodec* GetAudioCodec() override {

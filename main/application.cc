@@ -1300,6 +1300,16 @@ void Application::Schedule(std::function<void()>&& callback) {
     xEventGroupSetBits(event_group_, MAIN_EVENT_SCHEDULE);
 }
 
+#if CONFIG_AI_PASSPORT_TEST_CONSOLE
+void Application::SendTestText(const std::string& text) {
+    Schedule([this, text]() {
+        if (protocol_ && protocol_->IsAudioChannelOpened()) {
+            protocol_->SendWakeWordDetected(text);
+        }
+    });
+}
+#endif
+
 void Application::AbortSpeaking(AbortReason reason) {
     ESP_LOGI(TAG, "Abort speaking");
     aborted_ = true;
