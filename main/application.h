@@ -142,6 +142,10 @@ private:
     AecMode aec_mode_ = kAecOff;
     std::string last_error_message_;
     std::string startup_wake_word_hint_message_;
+#if CONFIG_OTA_NOTIFY_ONLY
+    // "New version x.y.z" when the server offered an update that was not installed.
+    std::string pending_update_notice_;
+#endif
     AudioService audio_service_;
     NotifyPlayer notify_player_;
     uint32_t notification_playback_id_ = 0;

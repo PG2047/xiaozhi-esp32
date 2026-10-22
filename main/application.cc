@@ -369,7 +369,16 @@ void Application::HandleActivationDoneEvent() {
     if (!has_error) {
         auto display = Board::GetInstance().GetDisplay();
         std::string message = std::string(Lang::Strings::VERSION) + ota_->GetCurrentVersion();
+#if CONFIG_OTA_NOTIFY_ONLY
+        if (!pending_update_notice_.empty()) {
+            // The check only runs at boot, so keep the notice up for a while.
+            display->ShowNotification(pending_update_notice_.c_str(), 30000);
+        } else {
+            display->ShowNotification(message.c_str());
+        }
+#else
         display->ShowNotification(message.c_str());
+#endif
         display->SetChatMessage("system", "");
     }
 
@@ -515,10 +524,18 @@ void Application::CheckNewVersion() {
         retry_delay = 10;  // Reset retry delay
 
         if (ota_->HasNewVersion()) {
+#if CONFIG_OTA_NOTIFY_ONLY
+            // Installing is left to the user: remember what is available and carry on.
+            ESP_LOGW(TAG, "Firmware %s is available but not installed (OTA_NOTIFY_ONLY)",
+                     ota_->GetFirmwareVersion().c_str());
+            pending_update_notice_ =
+                std::string(Lang::Strings::NEW_VERSION) + ota_->GetFirmwareVersion();
+#else
             if (UpgradeFirmware(ota_->GetFirmwareUrl(), ota_->GetFirmwareVersion())) {
                 return;  // This line will never be reached after reboot
             }
             // If upgrade failed, continue to normal operation
+#endif
         }
 
         // No new version, mark the current version as valid

@@ -6,6 +6,15 @@ config OTA_URL
     help
         The application will access this URL to check for new firmwares and server address.
 
+config OTA_NOTIFY_ONLY
+    bool "Only show available firmware updates, never install them"
+    default n
+    help
+        The OTA check still runs at boot. When the server offers a newer firmware, or
+        forces one, the device shows the version in the status bar for a while
+        instead of installing it, so a custom build is not replaced without notice.
+        Updating is then done by hand.
+
 choice
     prompt "Flash Assets"
     default FLASH_DEFAULT_ASSETS if !USE_EMOTE_MESSAGE_STYLE
