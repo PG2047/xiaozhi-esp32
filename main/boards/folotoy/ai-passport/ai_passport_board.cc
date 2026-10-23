@@ -31,9 +31,12 @@
 #include <esp_console.h>
 #include <esp_heap_caps.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <utility>
+#include <vector>
 #endif
 
 #define TAG "AiPassport"
@@ -1220,6 +1223,10 @@ private:
     //   tc volume <0-100>            set the volume
     //   tc subtitle words|sentences  how the spoken answer is lit
     //   tc wifi off|on               stop or restart the Wi-Fi station
+    //   tc hints                     show the key hints again (start-up only keeps them 4 s)
+    //   tc text <role> <text>        put a chat message on screen (ASCII text)
+    //   tc snap                      print the status row and the key hints as ARGB8888 hex
+    //                                (needs CONFIG_LV_USE_SNAPSHOT; tools/passport_snap.py)
     //   tc state                     print one line: READING {...}
     void InitializeTestConsole() {
         esp_console_repl_t* repl = nullptr;
@@ -1235,7 +1242,8 @@ private:
         esp_console_cmd_t command = {};
         command.command = "tc";
         command.help =
-            "Passport test commands: ask, say, toggle, key, volume, subtitle, wifi, state";
+            "Passport test commands: ask, say, toggle, key, volume, subtitle, wifi, hints, text, "
+            "snap, state";
         command.func_w_context = [](void* context, int argc, char** argv) -> int {
             return static_cast<AiPassportBoard*>(context)->RunTestCommand(argc, argv);
         };
@@ -1318,10 +1326,25 @@ private:
             } else {
                 WifiManager::GetInstance().StartStation();
             }
+        } else if (sub == "hints") {
+            static_cast<PassportDisplay*>(display_)->ShowKeyHints();
+        } else if (sub == "text" && argc > 3) {
+            const std::string role = argv[2];
+            std::string text;
+            for (int i = 3; i < argc; ++i) {
+                if (i > 3) {
+                    text += ' ';
+                }
+                text += argv[i];
+            }
+            app.Schedule(
+                [this, role, text]() { GetDisplay()->SetChatMessage(role.c_str(), text.c_str()); });
+        } else if (sub == "snap") {
+            PrintTestSnapshots();
         } else if (sub == "state") {
             app.Schedule([this]() { PrintTestState(); });
         } else {
-            printf("tc: ask|say|toggle|key|volume|subtitle|wifi|state\n");
+            printf("tc: ask|say|toggle|key|volume|subtitle|wifi|hints|text|snap|state\n");
             return 1;
         }
         return 0;
@@ -1335,9 +1358,61 @@ private:
         line += ",\"min\":" + std::to_string(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
         line += ",\"wifi\":";
         line += WifiManager::GetInstance().IsConnected() ? "true" : "false";
+        line += ",\"hints\":";
+        line += static_cast<PassportDisplay*>(display_)->KeyHintsVisible() ? "true" : "false";
         line += ",\"display\":" + display_->DescribeReadingState() + "}";
         printf("%s\n", line.c_str());
         fflush(stdout);
+    }
+
+    // Prints the status row and every key hint as ARGB8888 pixels in hex, one object at a
+    // time because the C3 has no room for a whole-screen snapshot, for
+    // tools/passport_snap.py in xiaozhi-brains to put back together. Holds the display
+    // lock throughout so no object goes away halfway; the screen pauses meanwhile.
+    void PrintTestSnapshots() {
+#if CONFIG_LV_USE_SNAPSHOT
+        DisplayLockGuard lock(display_);
+        std::vector<std::pair<const char*, lv_obj_t*>> objects;
+        lv_obj_t* container = lv_obj_get_child(lv_screen_active(), 0);
+        if (container != nullptr && lv_obj_get_child(container, 0) != nullptr) {
+            objects.emplace_back("status", lv_obj_get_child(container, 0));
+        }
+        lv_obj_t* layer = lv_layer_top();
+        for (uint32_t i = 0; i < lv_obj_get_child_count(layer); ++i) {
+            lv_obj_t* group = lv_obj_get_child(layer, i);
+            for (uint32_t j = 0; j < lv_obj_get_child_count(group); ++j) {
+                objects.emplace_back("hint", lv_obj_get_child(group, j));
+            }
+        }
+        for (const auto& [name, obj] : objects) {
+            lv_draw_buf_t* buf = lv_snapshot_take(obj, LV_COLOR_FORMAT_ARGB8888);
+            if (buf == nullptr) {
+                printf("SNAP %s failed\n", name);
+                continue;
+            }
+            lv_area_t area;
+            lv_obj_get_coords(obj, &area);
+            // The snapshot covers the object plus its extra draw area on every side.
+            const int32_t ext = (static_cast<int32_t>(buf->header.w) - lv_obj_get_width(obj)) / 2;
+            printf("SNAP %s %ld %ld %u %u %u\n", name, static_cast<long>(area.x1 - ext),
+                   static_cast<long>(area.y1 - ext), static_cast<unsigned>(buf->header.w),
+                   static_cast<unsigned>(buf->header.h), static_cast<unsigned>(buf->header.stride));
+            const size_t size = static_cast<size_t>(buf->header.stride) * buf->header.h;
+            char hex[2 * 128 + 1];
+            for (size_t i = 0; i < size; i += 128) {
+                const size_t n = std::min<size_t>(128, size - i);
+                for (size_t k = 0; k < n; ++k) {
+                    snprintf(hex + 2 * k, 3, "%02x", buf->data[i + k]);
+                }
+                printf("%s\n", hex);
+            }
+            lv_draw_buf_destroy(buf);
+        }
+        printf("SNAP END\n");
+        fflush(stdout);
+#else
+        printf("SNAP END (CONFIG_LV_USE_SNAPSHOT is off)\n");
+#endif
     }
 #endif
 
