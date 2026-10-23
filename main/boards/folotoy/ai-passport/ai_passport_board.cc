@@ -35,8 +35,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
-#include <utility>
-#include <vector>
 #endif
 
 #define TAG "AiPassport"
@@ -1225,8 +1223,7 @@ private:
     //   tc wifi off|on               stop or restart the Wi-Fi station
     //   tc hints                     show the key hints again (start-up only keeps them 4 s)
     //   tc text <role> <text>        put a chat message on screen (ASCII text)
-    //   tc snap                      print the status row and the key hints as ARGB8888 hex
-    //                                (needs CONFIG_LV_USE_SNAPSHOT; tools/passport_snap.py)
+    //   tc snap                      print the whole screen as RGB565 hex (tools/passport_snap.py)
     //   tc state                     print one line: READING {...}
     void InitializeTestConsole() {
         esp_console_repl_t* repl = nullptr;
@@ -1340,7 +1337,7 @@ private:
             app.Schedule(
                 [this, role, text]() { GetDisplay()->SetChatMessage(role.c_str(), text.c_str()); });
         } else if (sub == "snap") {
-            PrintTestSnapshots();
+            PrintTestScreen();
         } else if (sub == "state") {
             app.Schedule([this]() { PrintTestState(); });
         } else {
@@ -1365,54 +1362,53 @@ private:
         fflush(stdout);
     }
 
-    // Prints the status row and every key hint as ARGB8888 pixels in hex, one object at a
-    // time because the C3 has no room for a whole-screen snapshot, for
-    // tools/passport_snap.py in xiaozhi-brains to put back together. Holds the display
-    // lock throughout so no object goes away halfway; the screen pauses meanwhile.
-    void PrintTestSnapshots() {
-#if CONFIG_LV_USE_SNAPSHOT
+    // Prints the whole screen the way the panel receives it, for tools/passport_snap.py in
+    // xiaozhi-brains: the screen is redrawn once and every strip LVGL sends to the panel is
+    // printed straight from the draw buffer, one pixel row per line ("PX <x> <y> <hex>",
+    // RGB565 little-endian, before the panel driver swaps the bytes). Unlike lv_snapshot,
+    // which the C3 has no room for at full-screen size, it needs no buffer of its own. The
+    // redraw runs on the LVGL task (lv_async_call), whose stack is sized for drawing the
+    // whole screen, and the screen pauses while the rows print.
+    void PrintTestScreen() {
         DisplayLockGuard lock(display_);
-        std::vector<std::pair<const char*, lv_obj_t*>> objects;
-        lv_obj_t* container = lv_obj_get_child(lv_screen_active(), 0);
-        if (container != nullptr && lv_obj_get_child(container, 0) != nullptr) {
-            objects.emplace_back("status", lv_obj_get_child(container, 0));
-        }
-        lv_obj_t* layer = lv_layer_top();
-        for (uint32_t i = 0; i < lv_obj_get_child_count(layer); ++i) {
-            lv_obj_t* group = lv_obj_get_child(layer, i);
-            for (uint32_t j = 0; j < lv_obj_get_child_count(group); ++j) {
-                objects.emplace_back("hint", lv_obj_get_child(group, j));
+        lv_async_call([](void*) {
+            lv_display_t* disp = lv_display_get_default();
+            if (lv_display_get_color_format(disp) != LV_COLOR_FORMAT_RGB565) {
+                printf("SCREEN END (the display is not RGB565)\n");
+                return;
             }
-        }
-        for (const auto& [name, obj] : objects) {
-            lv_draw_buf_t* buf = lv_snapshot_take(obj, LV_COLOR_FORMAT_ARGB8888);
-            if (buf == nullptr) {
-                printf("SNAP %s failed\n", name);
-                continue;
+            printf("SCREEN BEGIN %ld %ld\n",
+                   static_cast<long>(lv_display_get_horizontal_resolution(disp)),
+                   static_cast<long>(lv_display_get_vertical_resolution(disp)));
+            lv_display_add_event_cb(disp, PrintTestScreenStrip, LV_EVENT_FLUSH_START, nullptr);
+            lv_obj_invalidate(lv_display_get_screen_active(disp));
+            lv_refr_now(disp);
+            lv_display_remove_event_cb_with_user_data(disp, PrintTestScreenStrip, nullptr);
+            printf("SCREEN END\n");
+            fflush(stdout);
+        }, nullptr);
+    }
+
+    // LV_EVENT_FLUSH_START: the strip is complete in the active draw buffer, one stride per
+    // row, and has not been byte-swapped for the panel yet.
+    static void PrintTestScreenStrip(lv_event_t* e) {
+        static constexpr char kHex[] = "0123456789abcdef";
+        const auto* area = static_cast<const lv_area_t*>(lv_event_get_param(e));
+        const lv_draw_buf_t* buf = lv_display_get_buf_active(lv_display_get_default());
+        const int32_t width = std::min<int32_t>(lv_area_get_width(area), DISPLAY_WIDTH);
+        char line[32 + 4 * DISPLAY_WIDTH];
+        for (int32_t y = area->y1; y <= area->y2; ++y) {
+            const uint8_t* row = buf->data + static_cast<size_t>(y - area->y1) * buf->header.stride;
+            int n = snprintf(line, 32, "PX %ld %ld ", static_cast<long>(area->x1),
+                             static_cast<long>(y));
+            for (int32_t i = 0; i < 2 * width; ++i) {
+                line[n++] = kHex[row[i] >> 4];
+                line[n++] = kHex[row[i] & 0x0f];
             }
-            lv_area_t area;
-            lv_obj_get_coords(obj, &area);
-            // The snapshot covers the object plus its extra draw area on every side.
-            const int32_t ext = (static_cast<int32_t>(buf->header.w) - lv_obj_get_width(obj)) / 2;
-            printf("SNAP %s %ld %ld %u %u %u\n", name, static_cast<long>(area.x1 - ext),
-                   static_cast<long>(area.y1 - ext), static_cast<unsigned>(buf->header.w),
-                   static_cast<unsigned>(buf->header.h), static_cast<unsigned>(buf->header.stride));
-            const size_t size = static_cast<size_t>(buf->header.stride) * buf->header.h;
-            char hex[2 * 128 + 1];
-            for (size_t i = 0; i < size; i += 128) {
-                const size_t n = std::min<size_t>(128, size - i);
-                for (size_t k = 0; k < n; ++k) {
-                    snprintf(hex + 2 * k, 3, "%02x", buf->data[i + k]);
-                }
-                printf("%s\n", hex);
-            }
-            lv_draw_buf_destroy(buf);
+            line[n++] = '\n';
+            // One write per row, so a log line from another task can only land between rows.
+            fwrite(line, 1, n, stdout);
         }
-        printf("SNAP END\n");
-        fflush(stdout);
-#else
-        printf("SNAP END (CONFIG_LV_USE_SNAPSHOT is off)\n");
-#endif
     }
 #endif
 

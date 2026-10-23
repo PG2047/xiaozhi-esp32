@@ -13,8 +13,7 @@
                 "CONFIG_PM_ENABLE=y",
                 "CONFIG_USE_READING_MESSAGE_STYLE=y",
                 "CONFIG_OTA_NOTIFY_ONLY=y",
-                "CONFIG_AI_PASSPORT_TEST_CONSOLE=y",
-                "CONFIG_LV_USE_SNAPSHOT=y"
+                "CONFIG_AI_PASSPORT_TEST_CONSOLE=y"
             ]
         }
     ]
