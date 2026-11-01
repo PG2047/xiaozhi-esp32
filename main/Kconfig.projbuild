@@ -676,6 +676,112 @@ config RESPEAKER_I2S_CLOCK_PROBE_ONLY
         This diagnostic does not initialize I2S or start the Xiaozhi application.
         Disable it and rebuild to restore normal operation.
 
+config RESPEAKER_XVF3800_BARGE_IN
+    bool "ReSpeaker: device-side barge-in from the XVF3800 speech-energy readout"
+    depends on BOARD_TYPE_SEEED_XIAO_ESP32S3_RESPEAKER_XVF3800
+    default n
+    help
+        Poll AEC_SPENERGY_VALUES over the XVF3800 I2C control interface while
+        the device is speaking. The XMOS computes speech energy after its own
+        AEC and echo suppression, so during playback a non-zero value means a
+        near-end talker, not the loudspeaker. When it stays above
+        RESPEAKER_XVF3800_BARGE_IN_THRESHOLD for RESPEAKER_XVF3800_BARGE_IN_HOLD_MS,
+        the board drops the local playback queue and sends an abort to the
+        server, without waiting for residual echo gating on the server side.
+
+config RESPEAKER_XVF3800_BARGE_IN_THRESHOLD
+    string "ReSpeaker: speech energy that counts as near-end speech"
+    depends on RESPEAKER_XVF3800_BARGE_IN
+    default "1000"
+    help
+        Compared against the largest of the four AEC_SPENERGY_VALUES (a float).
+        The XVF3800 user guide states that any value above 0 indicates speech;
+        on a reSpeaker XVF3800 (Seeed I2S firmware v1.0.4) the values are either
+        exactly 0 or above about 7e3, so the default only rejects numerical dust.
+        RESPEAKER_XVF3800_CONTROL_DIAGNOSTICS logs the values for calibration.
+
+config RESPEAKER_XVF3800_BARGE_IN_INPUT_RMS
+    int "ReSpeaker: processed-input RMS (16-bit) that also counts as near-end speech (0 = off)"
+    depends on RESPEAKER_XVF3800_BARGE_IN
+    range 0 32767
+    default 0
+    help
+        Second vote source. The XMOS output received over I2S is almost silent
+        while the loudspeaker plays (about 50 RMS, peaks under 350 in 16-bit
+        units over 51 s on a reSpeaker XVF3800 at volume 70), so a sustained
+        level above this threshold during playback is a near-end talker even
+        when the DSP's speech-energy estimate stays at 0.
+
+config RESPEAKER_XVF3800_BARGE_IN_HOLD_MS
+    int "ReSpeaker: near-end speech must add up to this long (ms)"
+    depends on RESPEAKER_XVF3800_BARGE_IN
+    range 50 2000
+    default 300
+    help
+        Polls that report speech are counted over a sliding window of
+        RESPEAKER_XVF3800_BARGE_IN_WINDOW_MS; the reply is interrupted once
+        they add up to this long. Speech energy flickers within a phrase, and
+        residual echo produced isolated blips of at most about 200 ms during
+        51 s of playback, so a window rather than a consecutive run is used.
+
+config RESPEAKER_XVF3800_BARGE_IN_WINDOW_MS
+    int "ReSpeaker: sliding window for counting speech polls (ms)"
+    depends on RESPEAKER_XVF3800_BARGE_IN
+    range 100 4000
+    default 600
+
+config RESPEAKER_XVF3800_BARGE_IN_GRACE_MS
+    int "ReSpeaker: ignore the first milliseconds of each reply"
+    depends on RESPEAKER_XVF3800_BARGE_IN
+    range 0 2000
+    default 300
+    help
+        Speech energy is not evaluated during this window after the device
+        enters the speaking state, so the start of a reply cannot be cut by a
+        transient.
+
+config RESPEAKER_XVF3800_PP_DTSENSITIVE
+    int "ReSpeaker: PP_DTSENSITIVE to write at boot (-1 = do not write)"
+    depends on RESPEAKER_XVF3800_BARGE_IN || RESPEAKER_XVF3800_CONTROL_DIAGNOSTICS
+    range -1 15
+    default 0
+    help
+        XVF3800 double-talk sensitivity (resource 17, command 31; XMOS and
+        Seeed default 0). 0 prefers echo suppression and mutes most near-end
+        speech while the loudspeaker plays; 10..15 add a near-end speech
+        detector and prefer double-talk. On a reSpeaker XVF3800 (Seeed I2S
+        firmware v1.0.4, small speaker at volume 70) 15 raised the residual
+        echo received by the ESP32 from about 50 to about 250 RMS during
+        playback, and 10 and 15 both let more room sound through, so 0 stays
+        the default. The XMOS keeps the last written value until it is
+        power-cycled (an ESP32 reset alone does not clear it), so 0 is written
+        explicitly at every boot to make the state deterministic.
+
+config RESPEAKER_XVF3800_PP_FMIN_SPEINDEX
+    string "ReSpeaker: PP_FMIN_SPEINDEX (Hz) to write at boot (empty = leave the XMOS default)"
+    depends on RESPEAKER_XVF3800_BARGE_IN || RESPEAKER_XVF3800_CONTROL_DIAGNOSTICS
+    default ""
+    help
+        Below this frequency the XVF3800 suppresses near-end speech harder during
+        double-talk (resource 17, command 30, float, XMOS default 593.75; the
+        Seeed firmware ships 1300). Re-sent at every boot.
+
+config RESPEAKER_XVF3800_CONTROL_DIAGNOSTICS
+    bool "ReSpeaker: log XVF3800 speech energy, DoA flag and AGC gain"
+    depends on BOARD_TYPE_SEEED_XIAO_ESP32S3_RESPEAKER_XVF3800
+    default n
+    help
+        Log the four AEC_SPENERGY_VALUES, the DOA_VALUE speech flag (Seeed I2S
+        firmware v1.0.6 or later), PP_AGCGAIN and AEC_AECCONVERGED every
+        200 ms while speaking and every 500 ms otherwise. Use it to calibrate
+        RESPEAKER_XVF3800_BARGE_IN_THRESHOLD; leave disabled normally.
+
+config RESPEAKER_XVF3800_CONTROL_POLL_MS
+    int "ReSpeaker: XVF3800 control poll interval (ms)"
+    depends on RESPEAKER_XVF3800_BARGE_IN || RESPEAKER_XVF3800_CONTROL_DIAGNOSTICS
+    range 20 500
+    default 50
+
 choice XIAOZHI_NETWORK_TYPE
     prompt "Network Type"
     depends on BOARD_TYPE_WAVESHARE_ESP32_P4_NANO

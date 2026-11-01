@@ -14,9 +14,12 @@
 #include <freertos/task.h>
 
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <vector>
 
 namespace {
@@ -31,6 +34,12 @@ constexpr gpio_num_t kI2sWsPin = GPIO_NUM_7;
 constexpr gpio_num_t kI2sDoutPin = GPIO_NUM_44;
 constexpr gpio_num_t kI2sDinPin = GPIO_NUM_43;
 constexpr uint8_t kXvf3800I2cAddress = 0x2C;
+// Seeed's XIAO I2C example uses the Wire default of 100 kHz; the XMOS INT-device
+// documentation lists 100 kbps as the control-interface maximum.
+constexpr uint32_t kXvf3800I2cSpeedHz = 100000;
+
+// RMS (16-bit units) of the most recent I2S input chunk, for the barge-in monitor.
+std::atomic<uint32_t> g_input_rms{0};
 #if CONFIG_RESPEAKER_I2S_EXTERNAL_CLOCK_48K
 constexpr int kAudioSampleRate = 48000;
 constexpr i2s_role_t kI2sRole = I2S_ROLE_SLAVE;
@@ -80,28 +89,37 @@ constexpr char kI2sRoleName[] = "master";
 }
 #endif
 
-void ProbeXvf3800() {
+i2c_master_bus_handle_t Xvf3800I2cBus() {
     static i2c_master_bus_handle_t bus = nullptr;
-    if (bus == nullptr) {
-        i2c_master_bus_config_t config = {
-            .i2c_port = I2C_NUM_0,
-            .sda_io_num = kI2cSdaPin,
-            .scl_io_num = kI2cSclPin,
-            .clk_source = I2C_CLK_SRC_DEFAULT,
-            .glitch_ignore_cnt = 7,
-            .intr_priority = 0,
-            .trans_queue_depth = 0,
-            .flags =
-                {
-                    .enable_internal_pullup = true,
-                },
-        };
+    if (bus != nullptr) {
+        return bus;
+    }
+    i2c_master_bus_config_t config = {
+        .i2c_port = I2C_NUM_0,
+        .sda_io_num = kI2cSdaPin,
+        .scl_io_num = kI2cSclPin,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .intr_priority = 0,
+        .trans_queue_depth = 0,
+        .flags =
+            {
+                .enable_internal_pullup = true,
+            },
+    };
 
-        const esp_err_t err = i2c_new_master_bus(&config, &bus);
-        if (err != ESP_OK) {
-            ESP_LOGW(kTag, "Could not initialize I2C bus: %s", esp_err_to_name(err));
-            return;
-        }
+    const esp_err_t err = i2c_new_master_bus(&config, &bus);
+    if (err != ESP_OK) {
+        ESP_LOGW(kTag, "Could not initialize I2C bus: %s", esp_err_to_name(err));
+        bus = nullptr;
+    }
+    return bus;
+}
+
+void ProbeXvf3800() {
+    i2c_master_bus_handle_t bus = Xvf3800I2cBus();
+    if (bus == nullptr) {
+        return;
     }
 
     const esp_err_t err = i2c_master_probe(bus, kXvf3800I2cAddress, pdMS_TO_TICKS(200));
@@ -112,6 +130,370 @@ void ProbeXvf3800() {
                  esp_err_to_name(err));
     }
 }
+
+#if CONFIG_RESPEAKER_XVF3800_BARGE_IN || CONFIG_RESPEAKER_XVF3800_CONTROL_DIAGNOSTICS
+// XVF3800 control interface over I2C. Resource and command IDs follow the "Control
+// Commands" appendix of the XMOS XVF3800 user guide (v3.2.1) and Seeed's I2C command
+// list for the reSpeaker XVF3800; the wire format follows Seeed's XIAO example:
+//   write: [resid][cmd][len][payload...]
+//   read:  write [resid][cmd | 0x80][len + 1], then read len + 1 bytes; byte 0 is the
+//          status (0 = success, 64 = servicer busy, retry), the rest is the payload.
+// Multi-byte values are little-endian, like the ESP32-S3.
+class Xvf3800Control {
+public:
+    static constexpr uint8_t kResPp = 17;        // post-processing servicer (PP_*)
+    static constexpr uint8_t kResGpo = 20;       // GPO servicer (Seeed LED and DoA commands)
+    static constexpr uint8_t kResAec = 33;       // AEC servicer (AEC_*)
+    static constexpr uint8_t kResAudioMgr = 35;  // audio manager (AUDIO_MGR_*)
+    static constexpr uint8_t kResApp = 48;       // application servicer (VERSION, ...)
+    static constexpr uint8_t kCmdVersion = 0;         // kResApp: 3 x uint8 MAJOR MINOR PATCH
+    static constexpr uint8_t kCmdAecConverged = 3;    // kResAec: int32
+    static constexpr uint8_t kCmdSpeechEnergy = 80;   // kResAec: 4 x float, AEC_SPENERGY_VALUES
+    static constexpr uint8_t kCmdAgcGain = 13;        // kResPp: float, PP_AGCGAIN
+    static constexpr uint8_t kStatusSuccess = 0;
+    static constexpr uint8_t kStatusRetry = 64;
+
+    bool Init() {
+        if (device_ != nullptr) {
+            return true;
+        }
+        i2c_master_bus_handle_t bus = Xvf3800I2cBus();
+        if (bus == nullptr) {
+            return false;
+        }
+        i2c_device_config_t config = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address = kXvf3800I2cAddress,
+            .scl_speed_hz = kXvf3800I2cSpeedHz,
+            .scl_wait_us = 0,
+            .flags =
+                {
+                    .disable_ack_check = 0,
+                },
+        };
+        const esp_err_t err = i2c_master_bus_add_device(bus, &config, &device_);
+        if (err != ESP_OK) {
+            ESP_LOGW(kTag, "XVF3800 control: could not add I2C device: %s", esp_err_to_name(err));
+            device_ = nullptr;
+            return false;
+        }
+        return true;
+    }
+
+    // Reads `length` payload bytes of command `cmd` on resource `resid` into `out`.
+    bool Read(uint8_t resid, uint8_t cmd, void* out, size_t length) {
+        if (device_ == nullptr || length == 0 || length > kMaxPayload) {
+            return false;
+        }
+        const uint8_t header[3] = {resid, static_cast<uint8_t>(cmd | 0x80),
+                                   static_cast<uint8_t>(length + 1)};
+        uint8_t buffer[kMaxPayload + 1];
+        for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+            esp_err_t err = i2c_master_transmit(device_, header, sizeof(header), kTimeoutMs);
+            if (err == ESP_OK) {
+                err = i2c_master_receive(device_, buffer, length + 1, kTimeoutMs);
+            }
+            if (err != ESP_OK) {
+                LogError(resid, cmd, "I2C %s", esp_err_to_name(err));
+                return false;
+            }
+            if (buffer[0] == kStatusSuccess) {
+                memcpy(out, buffer + 1, length);
+                return true;
+            }
+            if (buffer[0] != kStatusRetry) {
+                LogError(resid, cmd, "status %u", static_cast<unsigned>(buffer[0]));
+                return false;
+            }
+            vTaskDelay(pdMS_TO_TICKS(kRetryDelayMs));
+        }
+        LogError(resid, cmd, "still busy after %d attempts", kMaxAttempts);
+        return false;
+    }
+
+    // Writes `length` payload bytes to command `cmd` on resource `resid`. The XMOS does
+    // not acknowledge writes in-band; callers read the value back to confirm.
+    bool Write(uint8_t resid, uint8_t cmd, const void* payload, size_t length) {
+        if (device_ == nullptr || length == 0 || length > kMaxPayload) {
+            return false;
+        }
+        uint8_t buffer[3 + kMaxPayload] = {resid, cmd, static_cast<uint8_t>(length)};
+        memcpy(buffer + 3, payload, length);
+        const esp_err_t err = i2c_master_transmit(device_, buffer, 3 + length, kTimeoutMs);
+        if (err != ESP_OK) {
+            ESP_LOGW(kTag, "XVF3800 control write %u/%u failed: %s", static_cast<unsigned>(resid),
+                     static_cast<unsigned>(cmd), esp_err_to_name(err));
+            return false;
+        }
+        return true;
+    }
+
+private:
+    static constexpr size_t kMaxPayload = 48;
+    // Servicers answer asynchronously: a read may return status 64 until the DSP thread
+    // has processed the command (Seeed's xvf_host.py allows 100 attempts 10 ms apart).
+    static constexpr int kMaxAttempts = 20;
+    static constexpr int kRetryDelayMs = 5;
+    static constexpr int kTimeoutMs = 50;
+
+    template <typename... Args>
+    void LogError(uint8_t resid, uint8_t cmd, const char* format, Args... args) {
+        const int64_t now = esp_timer_get_time();
+        if (now - last_error_us_ < 5000000) {
+            return;
+        }
+        last_error_us_ = now;
+        char detail[64];
+        snprintf(detail, sizeof(detail), format, args...);
+        ESP_LOGW(kTag, "XVF3800 control read %u/%u failed: %s", static_cast<unsigned>(resid),
+                 static_cast<unsigned>(cmd), detail);
+    }
+
+    i2c_master_dev_handle_t device_ = nullptr;
+    int64_t last_error_us_ = -5000000;
+};
+
+// Logs the firmware version and the tuning parameters that decide what the ESP32-S3
+// receives (output routing, gains, AEC and echo-suppression settings).
+// Returns the firmware version packed as 0xMMmmpp, or 0 if the control interface
+// does not answer.
+uint32_t LogXvf3800Settings(Xvf3800Control& control) {
+    uint8_t version[3] = {};
+    if (!control.Read(Xvf3800Control::kResApp, Xvf3800Control::kCmdVersion, version,
+                      sizeof(version))) {
+        ESP_LOGW(kTag, "XVF3800 VERSION read failed; control interface unavailable");
+        return 0;
+    }
+    ESP_LOGI(kTag, "XVF3800 firmware v%u.%u.%u", version[0], version[1], version[2]);
+
+    struct Setting {
+        const char* name;
+        uint8_t resid;
+        uint8_t cmd;
+        char type;  // 'f' float, 'i' int32, 'u' uint8
+        uint8_t count;
+    };
+    static const Setting kSettings[] = {
+        {"AUDIO_MGR_OP_L", 35, 15, 'u', 2},     {"AUDIO_MGR_OP_R", 35, 19, 'u', 2},
+        {"AEC_ASROUTONOFF", 33, 35, 'i', 1},    {"AEC_ASROUTGAIN", 33, 36, 'f', 1},
+        {"AUDIO_MGR_MIC_GAIN", 35, 0, 'f', 1},  {"AUDIO_MGR_REF_GAIN", 35, 1, 'f', 1},
+        {"AUDIO_MGR_SYS_DELAY", 35, 26, 'i', 1}, {"AEC_HPFONOFF", 33, 1, 'i', 1},
+        {"AEC_NUM_FARENDS", 33, 72, 'i', 1},    {"AEC_AECCONVERGED", 33, 3, 'i', 1},
+        {"PP_AGCONOFF", 17, 10, 'i', 1},        {"PP_AGCMAXGAIN", 17, 11, 'f', 1},
+        {"PP_AGCDESIREDLEVEL", 17, 12, 'f', 1}, {"PP_AGCGAIN", 17, 13, 'f', 1},
+        {"PP_LIMITONOFF", 17, 19, 'i', 1},      {"PP_LIMITPLIMIT", 17, 20, 'f', 1},
+        {"PP_MIN_NS", 17, 21, 'f', 1},          {"PP_MIN_NN", 17, 22, 'f', 1},
+        {"PP_ECHOONOFF", 17, 23, 'i', 1},       {"PP_GAMMA_E", 17, 24, 'f', 1},
+        {"PP_GAMMA_ETAIL", 17, 25, 'f', 1},     {"PP_GAMMA_ENL", 17, 26, 'f', 1},
+        {"PP_NLATTENONOFF", 17, 27, 'i', 1},    {"PP_FMIN_SPEINDEX", 17, 30, 'f', 1},
+        {"PP_DTSENSITIVE", 17, 31, 'i', 1},     {"PP_ATTNS_MODE", 17, 32, 'i', 1},
+    };
+    for (const Setting& setting : kSettings) {
+        union {
+            float f[2];
+            int32_t i[2];
+            uint8_t u[8];
+        } value = {};
+        const size_t length = setting.type == 'u' ? setting.count : setting.count * 4U;
+        if (!control.Read(setting.resid, setting.cmd, &value, length)) {
+            ESP_LOGW(kTag, "XVF3800 %s read failed", setting.name);
+            continue;
+        }
+        char text[48] = {};
+        if (setting.type == 'f') {
+            snprintf(text, sizeof(text), "%g", static_cast<double>(value.f[0]));
+        } else if (setting.type == 'i') {
+            snprintf(text, sizeof(text), "%d", static_cast<int>(value.i[0]));
+        } else {
+            snprintf(text, sizeof(text), "%u, %u", static_cast<unsigned>(value.u[0]),
+                     static_cast<unsigned>(value.u[1]));
+        }
+        ESP_LOGI(kTag, "XVF3800 %s = %s", setting.name, text);
+    }
+    return (static_cast<uint32_t>(version[0]) << 16) | (static_cast<uint32_t>(version[1]) << 8) |
+           version[2];
+}
+
+// Polls the XVF3800 while the device is speaking. Near-end speech reported by the DSP
+// (which already subtracted what it is playing) ends the reply on the device: the
+// local playback queue is dropped and an abort is sent to the server, so interruption
+// does not depend on residual echo reaching the server's gate.
+class Xvf3800Monitor {
+public:
+    void Start() {
+        xTaskCreatePinnedToCore(
+            [](void* arg) {
+                static_cast<Xvf3800Monitor*>(arg)->Run();
+                vTaskDelete(nullptr);
+            },
+            "xvf3800_ctl", 4096, this, 3, nullptr, 1);
+    }
+
+private:
+#if CONFIG_RESPEAKER_XVF3800_BARGE_IN
+    static constexpr int64_t kGraceUs = CONFIG_RESPEAKER_XVF3800_BARGE_IN_GRACE_MS * 1000LL;
+    // Sliding window of polls: trigger once kHoldPolls of the last kWindowPolls saw speech.
+    static constexpr int kWindowPolls = std::max(
+        1, CONFIG_RESPEAKER_XVF3800_BARGE_IN_WINDOW_MS / CONFIG_RESPEAKER_XVF3800_CONTROL_POLL_MS);
+    static constexpr int kHoldPolls = std::max(
+        1, std::min(kWindowPolls, (CONFIG_RESPEAKER_XVF3800_BARGE_IN_HOLD_MS +
+                                   CONFIG_RESPEAKER_XVF3800_CONTROL_POLL_MS - 1) /
+                                      CONFIG_RESPEAKER_XVF3800_CONTROL_POLL_MS));
+    static_assert(kWindowPolls <= 64, "window must fit in the 64-bit history");
+#endif
+#if CONFIG_RESPEAKER_XVF3800_CONTROL_DIAGNOSTICS
+    static constexpr bool kDiagnostics = true;
+#else
+    static constexpr bool kDiagnostics = false;
+#endif
+
+    void Run() {
+        // Give the XMOS time to boot its own firmware before the first control read.
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        if (!control_.Init()) {
+            ESP_LOGW(kTag, "XVF3800 control unavailable; device-side barge-in disabled");
+            return;
+        }
+        const uint32_t version = LogXvf3800Settings(control_);
+        if (version == 0) {
+            return;
+        }
+        // Seeed I2S firmware: DOA_VALUE (angle, speech flag) exists from v1.0.6 as
+        // command 19 and moved to command 18 in v1.0.8.
+        doa_cmd_ = version >= 0x010008 ? 18 : (version >= 0x010006 ? 19 : 0);
+        ApplyOverrides();
+#if CONFIG_RESPEAKER_XVF3800_BARGE_IN
+        const float threshold = strtof(CONFIG_RESPEAKER_XVF3800_BARGE_IN_THRESHOLD, nullptr);
+        ESP_LOGI(kTag,
+                 "XVF3800 barge-in: speech energy > %g in %d of the last %d polls (%d ms), %d ms grace",
+                 static_cast<double>(threshold), kHoldPolls, kWindowPolls,
+                 CONFIG_RESPEAKER_XVF3800_CONTROL_POLL_MS, CONFIG_RESPEAKER_XVF3800_BARGE_IN_GRACE_MS);
+#endif
+
+        auto& app = Application::GetInstance();
+        while (true) {
+            vTaskDelay(pdMS_TO_TICKS(CONFIG_RESPEAKER_XVF3800_CONTROL_POLL_MS));
+            const int64_t now = esp_timer_get_time();
+            const bool speaking = app.GetDeviceState() == kDeviceStateSpeaking;
+            if (!speaking) {
+                speaking_since_us_ = 0;
+                history_ = 0;
+                armed_ = true;
+            } else if (speaking_since_us_ == 0) {
+                speaking_since_us_ = now;
+                history_ = 0;
+            }
+            const bool report =
+                kDiagnostics && now - last_report_us_ >= (speaking ? 200000 : 500000);
+            if (!speaking && !report) {
+                continue;
+            }
+
+            float energy[4] = {};
+            if (!control_.Read(Xvf3800Control::kResAec, Xvf3800Control::kCmdSpeechEnergy, energy,
+                               sizeof(energy))) {
+                continue;
+            }
+            [[maybe_unused]] const float peak =
+                std::max(std::max(energy[0], energy[1]), std::max(energy[2], energy[3]));
+            const uint32_t input_rms = g_input_rms.load(std::memory_order_relaxed);
+
+#if CONFIG_RESPEAKER_XVF3800_BARGE_IN
+            if (speaking && armed_ && now - speaking_since_us_ >= kGraceUs) {
+                const bool speech = peak > threshold ||
+                                    (CONFIG_RESPEAKER_XVF3800_BARGE_IN_INPUT_RMS > 0 &&
+                                     input_rms > static_cast<uint32_t>(CONFIG_RESPEAKER_XVF3800_BARGE_IN_INPUT_RMS));
+                history_ = (history_ << 1) | (speech ? 1ULL : 0ULL);
+                if (kWindowPolls < 64) {
+                    history_ &= (1ULL << kWindowPolls) - 1;
+                }
+                if (__builtin_popcountll(history_) >= kHoldPolls) {
+                    armed_ = false;
+                    history_ = 0;
+                    BargeIn(energy, input_rms);
+                }
+            }
+#endif
+            if (report) {
+                Report(speaking, energy, input_rms);
+                last_report_us_ = now;
+            }
+        }
+    }
+
+    // XMOS control writes are not persisted, so the tuning chosen for this product is
+    // re-sent at every boot and read back for the log.
+    void ApplyOverrides() {
+        if (CONFIG_RESPEAKER_XVF3800_PP_DTSENSITIVE >= 0) {
+            const int32_t value = CONFIG_RESPEAKER_XVF3800_PP_DTSENSITIVE;
+            int32_t readback = -1;
+            const bool ok = control_.Write(Xvf3800Control::kResPp, 31, &value, sizeof(value)) &&
+                            control_.Read(Xvf3800Control::kResPp, 31, &readback, sizeof(readback));
+            ESP_LOGI(kTag, "XVF3800 PP_DTSENSITIVE := %d (read back %d, %s)", static_cast<int>(value),
+                     static_cast<int>(readback), ok && readback == value ? "ok" : "FAILED");
+        }
+        if (CONFIG_RESPEAKER_XVF3800_PP_FMIN_SPEINDEX[0] != '\0') {
+            const float value = strtof(CONFIG_RESPEAKER_XVF3800_PP_FMIN_SPEINDEX, nullptr);
+            float readback = NAN;
+            const bool ok = control_.Write(Xvf3800Control::kResPp, 30, &value, sizeof(value)) &&
+                            control_.Read(Xvf3800Control::kResPp, 30, &readback, sizeof(readback));
+            ESP_LOGI(kTag, "XVF3800 PP_FMIN_SPEINDEX := %g (read back %g, %s)",
+                     static_cast<double>(value), static_cast<double>(readback),
+                     ok && readback == value ? "ok" : "FAILED");
+        }
+    }
+
+    void Report(bool speaking, const float* energy, uint32_t input_rms) {
+        uint16_t doa[2] = {};
+        const bool doa_ok = doa_cmd_ != 0 &&
+                            control_.Read(Xvf3800Control::kResGpo, doa_cmd_, doa, sizeof(doa));
+        float agc_gain = NAN;
+        control_.Read(Xvf3800Control::kResPp, Xvf3800Control::kCmdAgcGain, &agc_gain,
+                      sizeof(agc_gain));
+        int32_t converged = -1;
+        control_.Read(Xvf3800Control::kResAec, Xvf3800Control::kCmdAecConverged, &converged,
+                      sizeof(converged));
+        ESP_LOGI(kTag,
+                 "XVF3800 %s spenergy=%.3g/%.3g/%.3g/%.3g in_rms=%u vad=%d doa=%u speech=%u "
+                 "agc_gain=%.1f converged=%d",
+                 speaking ? "speaking" : "idle", static_cast<double>(energy[0]),
+                 static_cast<double>(energy[1]), static_cast<double>(energy[2]),
+                 static_cast<double>(energy[3]), static_cast<unsigned>(input_rms),
+                 Application::GetInstance().IsVoiceDetected() ? 1 : 0,
+                 doa_ok ? static_cast<unsigned>(doa[0]) : 0U,
+                 doa_ok ? static_cast<unsigned>(doa[1]) : 0U, static_cast<double>(agc_gain),
+                 static_cast<int>(converged));
+    }
+
+#if CONFIG_RESPEAKER_XVF3800_BARGE_IN
+    void BargeIn(const float* energy, uint32_t input_rms) {
+        ESP_LOGI(kTag,
+                 "XVF3800 near-end speech during playback (spenergy %.3g/%.3g/%.3g/%.3g, input rms %u); aborting",
+                 static_cast<double>(energy[0]), static_cast<double>(energy[1]),
+                 static_cast<double>(energy[2]), static_cast<double>(energy[3]),
+                 static_cast<unsigned>(input_rms));
+        // Same steps as the server's "tts stop" plus the wake-word path's queue flush,
+        // executed in the main task: tell the server, drop queued audio, start listening.
+        Application::GetInstance().Schedule([]() {
+            auto& app = Application::GetInstance();
+            if (app.GetDeviceState() != kDeviceStateSpeaking) {
+                return;
+            }
+            app.AbortSpeaking(kAbortReasonNone);
+            app.GetAudioService().ResetDecoder();
+            app.SetDeviceState(kDeviceStateListening);
+        });
+    }
+#endif
+
+    Xvf3800Control control_;
+    uint8_t doa_cmd_ = 0;
+    int64_t speaking_since_us_ = 0;
+    uint64_t history_ = 0;  // one bit per poll, 1 = speech energy above threshold
+    int64_t last_report_us_ = 0;
+    bool armed_ = true;
+};
+#endif  // CONFIG_RESPEAKER_XVF3800_BARGE_IN || CONFIG_RESPEAKER_XVF3800_CONTROL_DIAGNOSTICS
 
 class XiaoEsp32S3ReSpeakerXvf3800Board : public WifiBoard {
 private:
@@ -262,10 +644,12 @@ private:
             }
 
             const size_t frames = bytes_read / (2 * sizeof(int32_t));
+            uint64_t square_sum = 0;
             for (size_t i = 0; i < frames; ++i) {
                 const int32_t left = rx_buffer_[i * 2];
                 const int32_t value = left >> 16;
                 dest[i] = static_cast<int16_t>(value);
+                square_sum += static_cast<uint64_t>(static_cast<int64_t>(value) * value);
 #if CONFIG_RESPEAKER_AUDIO_DIAGNOSTICS
                 const int32_t right = rx_buffer_[i * 2 + 1];
                 const uint32_t left_peak =
@@ -279,6 +663,10 @@ private:
                 rx_rails_ += value == INT16_MIN || value == INT16_MAX;
                 rx_square_sum_ += static_cast<uint64_t>(static_cast<int64_t>(value) * value);
 #endif
+            }
+            if (frames > 0) {
+                g_input_rms.store(static_cast<uint32_t>(std::sqrt(static_cast<double>(square_sum) / frames)),
+                                  std::memory_order_relaxed);
             }
 #if CONFIG_RESPEAKER_AUDIO_DIAGNOSTICS
             rx_frames_ += static_cast<uint32_t>(frames);
@@ -338,6 +726,10 @@ public:
         ProbeXvf3800();
 #if CONFIG_RESPEAKER_I2S_CLOCK_PROBE_ONLY
         ProbeExternalI2sClock();
+#endif
+#if CONFIG_RESPEAKER_XVF3800_BARGE_IN || CONFIG_RESPEAKER_XVF3800_CONTROL_DIAGNOSTICS
+        static Xvf3800Monitor xvf3800_monitor;
+        xvf3800_monitor.Start();
 #endif
 
         boot_button_.OnClick([this]() {
