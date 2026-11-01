@@ -438,6 +438,14 @@ private:
             ESP_LOGI(kTag, "XVF3800 PP_DTSENSITIVE := %d (read back %d, %s)", static_cast<int>(value),
                      static_cast<int>(readback), ok && readback == value ? "ok" : "FAILED");
         }
+        if (CONFIG_RESPEAKER_XVF3800_MIC_GAIN[0] != '\0') {
+            const float gain = strtof(CONFIG_RESPEAKER_XVF3800_MIC_GAIN, nullptr);
+            float readback = NAN;
+            const bool ok = control_.Write(Xvf3800Control::kResAudioMgr, 0, &gain, sizeof(gain)) &&
+                            control_.Read(Xvf3800Control::kResAudioMgr, 0, &readback, sizeof(readback));
+            ESP_LOGI(kTag, "XVF3800 AUDIO_MGR_MIC_GAIN := %g (read back %g, %s)", static_cast<double>(gain),
+                     static_cast<double>(readback), ok && readback == gain ? "ok" : "FAILED");
+        }
         if (CONFIG_RESPEAKER_XVF3800_PP_AGC_FIXED_GAIN[0] != '\0') {
             const float gain = strtof(CONFIG_RESPEAKER_XVF3800_PP_AGC_FIXED_GAIN, nullptr);
             const int32_t off = 0;

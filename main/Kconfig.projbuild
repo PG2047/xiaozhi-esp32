@@ -792,6 +792,19 @@ config RESPEAKER_XVF3800_PP_AGC_FIXED_GAIN
         reaches the ESP32 several times quieter than the same speech in
         silence. A fixed gain keeps the level comparable. Re-sent at every boot.
 
+config RESPEAKER_XVF3800_MIC_GAIN
+    string "ReSpeaker: AUDIO_MGR_MIC_GAIN to write at boot (empty = leave the XMOS value)"
+    depends on RESPEAKER_XVF3800_BARGE_IN || RESPEAKER_XVF3800_CONTROL_DIAGNOSTICS
+    default ""
+    help
+        Linear gain applied to all four microphones before the XVF3800 AEC
+        (resource 35, command 0; XMOS default 10, Seeed I2S firmware v1.0.4
+        ships 90). With 90 a talker at normal distance already clips the
+        processed output (full-scale samples in RESPEAKER_AUDIO_DIAGNOSTICS'
+        rails16 count), which garbles transcription of close speech. The XMOS
+        manual wants the microphone peaks about 6 dB below the reference.
+        Re-sent at every boot.
+
 config RESPEAKER_XVF3800_CONTROL_DIAGNOSTICS
     bool "ReSpeaker: log XVF3800 speech energy, DoA flag and AGC gain"
     depends on BOARD_TYPE_SEEED_XIAO_ESP32S3_RESPEAKER_XVF3800
