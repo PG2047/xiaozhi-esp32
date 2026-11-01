@@ -712,6 +712,18 @@ config RESPEAKER_XVF3800_BARGE_IN_INPUT_RMS
         level above this threshold during playback is a near-end talker even
         when the DSP's speech-energy estimate stays at 0.
 
+config RESPEAKER_XVF3800_BARGE_IN_MIN_RMS
+    int "ReSpeaker: a speech-energy vote also needs at least this input RMS (0 = off)"
+    range 0 32767
+    depends on RESPEAKER_XVF3800_BARGE_IN
+    default 150
+    help
+        The XVF3800 free-running beam is deliberately sensitive and reports
+        speech energy on noise and residual echo (single polls of 1e5..1e6
+        with the ESP input at 60..120 RMS were seen during quiet playback).
+        Requiring the processed input to carry some level at the same time
+        rejects those; a real near-end talker reaches hundreds to thousands.
+
 config RESPEAKER_XVF3800_BARGE_IN_HOLD_MS
     int "ReSpeaker: near-end speech must add up to this long (ms)"
     depends on RESPEAKER_XVF3800_BARGE_IN
@@ -750,11 +762,13 @@ config RESPEAKER_XVF3800_PP_DTSENSITIVE
         Seeed default 0). 0 prefers echo suppression and mutes most near-end
         speech while the loudspeaker plays; 10..15 add a near-end speech
         detector and prefer double-talk. On a reSpeaker XVF3800 (Seeed I2S
-        firmware v1.0.4, small speaker at volume 70) 15 raised the residual
-        echo received by the ESP32 from about 50 to about 250 RMS during
-        playback, and 10 and 15 both let more room sound through, so 0 stays
-        the default. The XMOS keeps the last written value until it is
-        power-cycled (an ESP32 reset alone does not clear it), so 0 is written
+        firmware v1.0.4, speaker at volume 70) a talker at 0.5..1 m did not
+        reach the ESP32 at all during playback with 0 or 10 (input stayed at
+        60..80 RMS, speech energy 0); 15 together with a fixed AGC gain let
+        the same speech through at thousands of RMS while the playback floor
+        stayed near 25 RMS in a quiet room. Room speech then interrupts too.
+        The XMOS keeps the last written value until it is power-cycled (an
+        ESP32 reset alone does not clear it), so the value is written
         explicitly at every boot to make the state deterministic.
 
 config RESPEAKER_XVF3800_PP_FMIN_SPEINDEX
@@ -765,6 +779,18 @@ config RESPEAKER_XVF3800_PP_FMIN_SPEINDEX
         Below this frequency the XVF3800 suppresses near-end speech harder during
         double-talk (resource 17, command 30, float, XMOS default 593.75; the
         Seeed firmware ships 1300). Re-sent at every boot.
+
+config RESPEAKER_XVF3800_PP_AGC_FIXED_GAIN
+    string "ReSpeaker: freeze the XVF3800 AGC at this gain (empty = leave the AGC adaptive)"
+    depends on RESPEAKER_XVF3800_BARGE_IN || RESPEAKER_XVF3800_CONTROL_DIAGNOSTICS
+    default ""
+    help
+        Writes PP_AGCGAIN (resource 17, command 13, linear factor) and then
+        PP_AGCONOFF = 0 at boot. The adaptive AGC drops its gain to about 1.5
+        while the loudspeaker plays (it measures the beam power, echo included)
+        and climbs to 10..17 in silence, so near-end speech during playback
+        reaches the ESP32 several times quieter than the same speech in
+        silence. A fixed gain keeps the level comparable. Re-sent at every boot.
 
 config RESPEAKER_XVF3800_CONTROL_DIAGNOSTICS
     bool "ReSpeaker: log XVF3800 speech energy, DoA flag and AGC gain"

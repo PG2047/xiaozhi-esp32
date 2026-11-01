@@ -365,8 +365,10 @@ private:
 #if CONFIG_RESPEAKER_XVF3800_BARGE_IN
         const float threshold = strtof(CONFIG_RESPEAKER_XVF3800_BARGE_IN_THRESHOLD, nullptr);
         ESP_LOGI(kTag,
-                 "XVF3800 barge-in: speech energy > %g in %d of the last %d polls (%d ms), %d ms grace",
-                 static_cast<double>(threshold), kHoldPolls, kWindowPolls,
+                 "XVF3800 barge-in: speech energy > %g with input rms >= %d, or input rms > %d, in %d of "
+                 "the last %d polls (%d ms), %d ms grace",
+                 static_cast<double>(threshold), CONFIG_RESPEAKER_XVF3800_BARGE_IN_MIN_RMS,
+                 CONFIG_RESPEAKER_XVF3800_BARGE_IN_INPUT_RMS, kHoldPolls, kWindowPolls,
                  CONFIG_RESPEAKER_XVF3800_CONTROL_POLL_MS, CONFIG_RESPEAKER_XVF3800_BARGE_IN_GRACE_MS);
 #endif
 
@@ -400,9 +402,13 @@ private:
 
 #if CONFIG_RESPEAKER_XVF3800_BARGE_IN
             if (speaking && armed_ && now - speaking_since_us_ >= kGraceUs) {
-                const bool speech = peak > threshold ||
-                                    (CONFIG_RESPEAKER_XVF3800_BARGE_IN_INPUT_RMS > 0 &&
-                                     input_rms > static_cast<uint32_t>(CONFIG_RESPEAKER_XVF3800_BARGE_IN_INPUT_RMS));
+                const bool energy_vote =
+                    peak > threshold &&
+                    input_rms >= static_cast<uint32_t>(CONFIG_RESPEAKER_XVF3800_BARGE_IN_MIN_RMS);
+                const bool level_vote =
+                    CONFIG_RESPEAKER_XVF3800_BARGE_IN_INPUT_RMS > 0 &&
+                    input_rms > static_cast<uint32_t>(CONFIG_RESPEAKER_XVF3800_BARGE_IN_INPUT_RMS);
+                const bool speech = energy_vote || level_vote;
                 history_ = (history_ << 1) | (speech ? 1ULL : 0ULL);
                 if (kWindowPolls < 64) {
                     history_ &= (1ULL << kWindowPolls) - 1;
@@ -431,6 +437,19 @@ private:
                             control_.Read(Xvf3800Control::kResPp, 31, &readback, sizeof(readback));
             ESP_LOGI(kTag, "XVF3800 PP_DTSENSITIVE := %d (read back %d, %s)", static_cast<int>(value),
                      static_cast<int>(readback), ok && readback == value ? "ok" : "FAILED");
+        }
+        if (CONFIG_RESPEAKER_XVF3800_PP_AGC_FIXED_GAIN[0] != '\0') {
+            const float gain = strtof(CONFIG_RESPEAKER_XVF3800_PP_AGC_FIXED_GAIN, nullptr);
+            const int32_t off = 0;
+            float gain_back = NAN;
+            int32_t on_back = -1;
+            const bool ok = control_.Write(Xvf3800Control::kResPp, 13, &gain, sizeof(gain)) &&
+                            control_.Write(Xvf3800Control::kResPp, 10, &off, sizeof(off)) &&
+                            control_.Read(Xvf3800Control::kResPp, 13, &gain_back, sizeof(gain_back)) &&
+                            control_.Read(Xvf3800Control::kResPp, 10, &on_back, sizeof(on_back));
+            ESP_LOGI(kTag, "XVF3800 PP_AGCGAIN := %g, PP_AGCONOFF := 0 (read back %g / %d, %s)",
+                     static_cast<double>(gain), static_cast<double>(gain_back),
+                     static_cast<int>(on_back), ok && on_back == 0 ? "ok" : "FAILED");
         }
         if (CONFIG_RESPEAKER_XVF3800_PP_FMIN_SPEINDEX[0] != '\0') {
             const float value = strtof(CONFIG_RESPEAKER_XVF3800_PP_FMIN_SPEINDEX, nullptr);
