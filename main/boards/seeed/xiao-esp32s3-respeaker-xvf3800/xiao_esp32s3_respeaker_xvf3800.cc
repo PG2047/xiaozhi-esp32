@@ -455,9 +455,13 @@ private:
                     CONFIG_RESPEAKER_XVF3800_BARGE_IN_INPUT_RMS > 0 &&
                     input_rms > static_cast<uint32_t>(CONFIG_RESPEAKER_XVF3800_BARGE_IN_INPUT_RMS);
                 const bool speech = energy_vote || level_vote;
+                // A loud poll also needs the DSP's speech energy: typing next to the
+                // board gave consecutive polls above 2000 RMS with all four energies 0,
+                // while every recorded barge-in (and every knock) carried energy.
                 const bool strong =
                     CONFIG_RESPEAKER_XVF3800_BARGE_IN_STRONG_RMS > 0 &&
-                    input_rms > static_cast<uint32_t>(CONFIG_RESPEAKER_XVF3800_BARGE_IN_STRONG_RMS);
+                    input_rms > static_cast<uint32_t>(CONFIG_RESPEAKER_XVF3800_BARGE_IN_STRONG_RMS) &&
+                    peak > threshold;
                 history_ = (history_ << 1) | (speech ? 1ULL : 0ULL);
                 strong_history_ = (strong_history_ << 1) | (strong ? 1ULL : 0ULL);
                 if (kWindowPolls < 64) {

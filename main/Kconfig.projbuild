@@ -710,7 +710,10 @@ config RESPEAKER_XVF3800_BARGE_IN_INPUT_RMS
         while the loudspeaker plays (about 50 RMS, peaks under 350 in 16-bit
         units over 51 s on a reSpeaker XVF3800 at volume 70), so a sustained
         level above this threshold during playback is a near-end talker even
-        when the DSP's speech-energy estimate stays at 0.
+        when the DSP's speech-energy estimate stays at 0. With PP_DTSENSITIVE 15
+        and the AGC frozen at 4, every recorded barge-in carried speech energy,
+        while typing next to the board added level votes without any, so the
+        reSpeaker XVF3800 config.json leaves this at 0.
 
 config RESPEAKER_XVF3800_BARGE_IN_MIN_RMS
     int "ReSpeaker: a speech-energy vote also needs at least this input RMS (0 = off)"
@@ -740,7 +743,10 @@ config RESPEAKER_XVF3800_BARGE_IN_STRONG_RMS
         XVF3800 at volume 70 with the AGC frozen at 4, single polls of residual
         echo reached 1437 RMS over 100 s of quiet playback and 2774 right after
         a barge-in, while the loud part of a barge-in phrase ran 2000..6700 on
-        consecutive polls.
+        consecutive polls. A loud poll also needs speech energy above
+        RESPEAKER_XVF3800_BARGE_IN_THRESHOLD: typing on a keyboard next to the
+        board gave consecutive polls above 2000 RMS with all four energies at 0,
+        while every recorded barge-in carried energy on its loud polls.
 
 config RESPEAKER_XVF3800_BARGE_IN_STRONG_POLLS
     int "ReSpeaker: polls above STRONG_RMS that trigger the fast path"
