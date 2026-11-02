@@ -823,6 +823,9 @@ config RESPEAKER_XVF3800_BARGE_IN_HOLD_MS
         they add up to this long. Speech energy flickers within a phrase, and
         residual echo produced isolated blips of at most about 200 ms during
         51 s of playback, so a window rather than a consecutive run is used.
+        The reSpeaker XVF3800 config.json uses 400 (8 of 12 polls): the ringing
+        of two quick knocks on the table filled 6 polls with speech energy,
+        while every recorded barge-in was caught by the fast path first.
 
 config RESPEAKER_XVF3800_BARGE_IN_WINDOW_MS
     int "ReSpeaker: sliding window for counting speech polls (ms)"
