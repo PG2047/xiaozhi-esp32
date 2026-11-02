@@ -790,7 +790,9 @@ config RESPEAKER_XVF3800_PP_AGC_FIXED_GAIN
         while the loudspeaker plays (it measures the beam power, echo included)
         and climbs to 10..17 in silence, so near-end speech during playback
         reaches the ESP32 several times quieter than the same speech in
-        silence. A fixed gain keeps the level comparable. Re-sent at every boot.
+        silence. A fixed gain keeps the level comparable. On a reSpeaker XVF3800
+        8 let close speech (20..30 cm) reach 12,000..14,000 RMS and clip; 4 keeps
+        wake-up at low volume and device-side barge-in. Re-sent at every boot.
 
 config RESPEAKER_XVF3800_MIC_GAIN
     string "ReSpeaker: AUDIO_MGR_MIC_GAIN to write at boot (empty = leave the XMOS value)"
