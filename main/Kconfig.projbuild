@@ -775,6 +775,37 @@ config RESPEAKER_XVF3800_BARGE_IN_TRACE
         test session can be replayed offline against other vote rules. About
         20 lines per second during playback; keep it off in normal builds.
 
+config RESPEAKER_XVF3800_ECHO_GUARD
+    bool "ReSpeaker: reboot the XMOS when replies keep starting with near-full-scale echo"
+    depends on RESPEAKER_XVF3800_BARGE_IN
+    default n
+    help
+        On a reSpeaker XVF3800 one near-full-scale input during playback left the
+        XMOS echo canceller diverged: every later reply started at 19k..25k RMS,
+        the server took the device's own voice for the user and cut each reply
+        within a second, so the canceller never reconverged. Resetting the ESP
+        does not reset the XMOS; only a power cycle did. With this option, when
+        RESPEAKER_XVF3800_ECHO_GUARD_REPLIES replies in a row carry input above
+        RESPEAKER_XVF3800_ECHO_GUARD_RMS on two polls within their first 800 ms,
+        the XMOS is rebooted over I2C (REBOOT, resid 48 / cmd 7) once the reply
+        has ended, and the boot-time overrides are written again.
+
+config RESPEAKER_XVF3800_ECHO_GUARD_RMS
+    int "ReSpeaker: input RMS at the start of a reply that counts as runaway echo"
+    depends on RESPEAKER_XVF3800_ECHO_GUARD
+    range 1 32767
+    default 8000
+    help
+        Healthy replies started below 500 RMS and barge-ins at the start of a
+        reply stayed under 6000; every reply of the diverged state had at least
+        two polls above 12000 in its first 800 ms.
+
+config RESPEAKER_XVF3800_ECHO_GUARD_REPLIES
+    int "ReSpeaker: replies in a row that must start that loud"
+    depends on RESPEAKER_XVF3800_ECHO_GUARD
+    range 1 10
+    default 2
+
 config RESPEAKER_XVF3800_BARGE_IN_HOLD_MS
     int "ReSpeaker: near-end speech must add up to this long (ms)"
     depends on RESPEAKER_XVF3800_BARGE_IN

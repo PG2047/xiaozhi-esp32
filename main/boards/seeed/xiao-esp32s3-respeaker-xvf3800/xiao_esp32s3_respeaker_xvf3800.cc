@@ -147,6 +147,8 @@ public:
     static constexpr uint8_t kResAudioMgr = 35;  // audio manager (AUDIO_MGR_*)
     static constexpr uint8_t kResApp = 48;       // application servicer (VERSION, ...)
     static constexpr uint8_t kCmdVersion = 0;         // kResApp: 3 x uint8 MAJOR MINOR PATCH
+    static constexpr uint8_t kCmdReboot = 7;          // kResApp: uint8, write-only, any value
+    static constexpr uint8_t kCmdAecPathChange = 0;   // kResAec: int32, AEC_AECPATHCHANGE
     static constexpr uint8_t kCmdAecConverged = 3;    // kResAec: int32
     static constexpr uint8_t kCmdSpeechEnergy = 80;   // kResAec: 4 x float, AEC_SPENERGY_VALUES
     static constexpr uint8_t kCmdAgcGain = 13;        // kResPp: float, PP_AGCGAIN
@@ -351,6 +353,18 @@ private:
     static constexpr int kStrongPolls =
         std::max(1, std::min(kStrongWindowPolls, CONFIG_RESPEAKER_XVF3800_BARGE_IN_STRONG_POLLS));
 #endif
+#if CONFIG_RESPEAKER_XVF3800_ECHO_GUARD
+    // Echo guard. A reply that carries near-full-scale input on two polls within its
+    // first 800 ms is the device hearing itself: on 11-02 one overload during playback
+    // left the XMOS echo canceller diverged, every later reply started at 19k..25k RMS,
+    // the server took the echo for the user and cut each reply within a second, so the
+    // canceller never got the playback it needs to reconverge, and ESP resets do not
+    // reset the XMOS. After a few such replies in a row the XMOS is rebooted (it comes
+    // back with fresh filters and defaults, so the overrides are written again).
+    static constexpr int64_t kEchoGuardWindowUs = 800000;
+    static constexpr int kEchoGuardPolls = 2;
+    static constexpr int64_t kEchoGuardCooldownUs = 60000000;
+#endif
 #if CONFIG_RESPEAKER_XVF3800_CONTROL_DIAGNOSTICS
     static constexpr bool kDiagnostics = true;
 #else
@@ -383,6 +397,13 @@ private:
                  CONFIG_RESPEAKER_XVF3800_CONTROL_POLL_MS, CONFIG_RESPEAKER_XVF3800_BARGE_IN_STRONG_RMS,
                  kStrongPolls, kStrongWindowPolls, CONFIG_RESPEAKER_XVF3800_BARGE_IN_GRACE_MS);
 #endif
+#if CONFIG_RESPEAKER_XVF3800_ECHO_GUARD
+        ESP_LOGI(kTag,
+                 "XVF3800 echo guard: reboot the XMOS after %d replies in a row with input rms > %d "
+                 "on %d polls in their first %lld ms",
+                 CONFIG_RESPEAKER_XVF3800_ECHO_GUARD_REPLIES, CONFIG_RESPEAKER_XVF3800_ECHO_GUARD_RMS,
+                 kEchoGuardPolls, static_cast<long long>(kEchoGuardWindowUs / 1000));
+#endif
 
         auto& app = Application::GetInstance();
         while (true) {
@@ -390,6 +411,11 @@ private:
             const int64_t now = esp_timer_get_time();
             const bool speaking = app.GetDeviceState() == kDeviceStateSpeaking;
             if (!speaking) {
+#if CONFIG_RESPEAKER_XVF3800_ECHO_GUARD
+                if (speaking_since_us_ != 0) {
+                    EchoGuardReplyEnded();  // a reply just ended (or was aborted)
+                }
+#endif
                 speaking_since_us_ = 0;
                 history_ = 0;
                 strong_history_ = 0;
@@ -414,6 +440,12 @@ private:
                 std::max(std::max(energy[0], energy[1]), std::max(energy[2], energy[3]));
             const uint32_t input_rms = g_input_rms.load(std::memory_order_relaxed);
 
+#if CONFIG_RESPEAKER_XVF3800_ECHO_GUARD
+            if (speaking && now - speaking_since_us_ <= kEchoGuardWindowUs &&
+                input_rms > static_cast<uint32_t>(CONFIG_RESPEAKER_XVF3800_ECHO_GUARD_RMS)) {
+                ++reply_loud_polls_;
+            }
+#endif
 #if CONFIG_RESPEAKER_XVF3800_BARGE_IN
             if (speaking && armed_ && now - speaking_since_us_ >= kGraceUs) {
                 const bool energy_vote =
@@ -510,16 +542,19 @@ private:
         int32_t converged = -1;
         control_.Read(Xvf3800Control::kResAec, Xvf3800Control::kCmdAecConverged, &converged,
                       sizeof(converged));
+        int32_t path_change = -1;
+        control_.Read(Xvf3800Control::kResAec, Xvf3800Control::kCmdAecPathChange, &path_change,
+                      sizeof(path_change));
         ESP_LOGI(kTag,
                  "XVF3800 %s spenergy=%.3g/%.3g/%.3g/%.3g in_rms=%u vad=%d doa=%u speech=%u "
-                 "agc_gain=%.1f converged=%d",
+                 "agc_gain=%.1f converged=%d path_change=%d",
                  speaking ? "speaking" : "idle", static_cast<double>(energy[0]),
                  static_cast<double>(energy[1]), static_cast<double>(energy[2]),
                  static_cast<double>(energy[3]), static_cast<unsigned>(input_rms),
                  Application::GetInstance().IsVoiceDetected() ? 1 : 0,
                  doa_ok ? static_cast<unsigned>(doa[0]) : 0U,
                  doa_ok ? static_cast<unsigned>(doa[1]) : 0U, static_cast<double>(agc_gain),
-                 static_cast<int>(converged));
+                 static_cast<int>(converged), static_cast<int>(path_change));
     }
 
 #if CONFIG_RESPEAKER_XVF3800_BARGE_IN
@@ -543,11 +578,64 @@ private:
     }
 #endif
 
+#if CONFIG_RESPEAKER_XVF3800_ECHO_GUARD
+    // Called on the first poll after a reply ended, so the XMOS (which also drives the
+    // loudspeaker) is never rebooted in the middle of playback.
+    void EchoGuardReplyEnded() {
+        const bool loud_start = reply_loud_polls_ >= kEchoGuardPolls;
+        reply_loud_polls_ = 0;
+        echo_replies_ = loud_start ? echo_replies_ + 1 : 0;
+        if (echo_replies_ < CONFIG_RESPEAKER_XVF3800_ECHO_GUARD_REPLIES) {
+            return;
+        }
+        echo_replies_ = 0;
+        const int64_t now = esp_timer_get_time();
+        if (now - last_reboot_us_ < kEchoGuardCooldownUs) {
+            ESP_LOGW(kTag, "XVF3800 echo guard: replies still start with loud echo, but the XMOS "
+                           "was rebooted less than a minute ago");
+            return;
+        }
+        last_reboot_us_ = now;
+        ESP_LOGW(kTag,
+                 "XVF3800 echo guard: %d replies in a row started with input rms > %d; the echo "
+                 "canceller looks diverged, rebooting the XMOS",
+                 CONFIG_RESPEAKER_XVF3800_ECHO_GUARD_REPLIES, CONFIG_RESPEAKER_XVF3800_ECHO_GUARD_RMS);
+        const uint8_t any = 1;
+        if (!control_.Write(Xvf3800Control::kResApp, Xvf3800Control::kCmdReboot, &any, sizeof(any))) {
+            ESP_LOGW(kTag, "XVF3800 echo guard: REBOOT write failed");
+            return;
+        }
+        // Same allowance as at power-up, then wait for the application servicer to answer.
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        uint8_t version[3] = {};
+        bool back = false;
+        for (int attempt = 0; attempt < 10 && !back; ++attempt) {
+            back = control_.Read(Xvf3800Control::kResApp, Xvf3800Control::kCmdVersion, version,
+                                 sizeof(version));
+            if (!back) {
+                vTaskDelay(pdMS_TO_TICKS(500));
+            }
+        }
+        if (!back) {
+            ESP_LOGW(kTag, "XVF3800 echo guard: XMOS does not answer after the reboot");
+            return;
+        }
+        ESP_LOGI(kTag, "XVF3800 echo guard: XMOS back (v%u.%u.%u), writing the overrides again",
+                 version[0], version[1], version[2]);
+        ApplyOverrides();
+    }
+#endif
+
     Xvf3800Control control_;
     uint8_t doa_cmd_ = 0;
     int64_t speaking_since_us_ = 0;
     uint64_t history_ = 0;  // one bit per poll, 1 = speech energy above threshold
     uint64_t strong_history_ = 0;  // one bit per poll, 1 = input rms above STRONG_RMS
+#if CONFIG_RESPEAKER_XVF3800_ECHO_GUARD
+    int reply_loud_polls_ = 0;  // polls above ECHO_GUARD_RMS in the current reply's start
+    int echo_replies_ = 0;      // consecutive replies that started that loud
+    int64_t last_reboot_us_ = -kEchoGuardCooldownUs;
+#endif
     int64_t last_report_us_ = 0;
     bool armed_ = true;
 };
