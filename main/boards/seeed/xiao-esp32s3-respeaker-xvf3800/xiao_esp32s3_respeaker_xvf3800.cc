@@ -340,6 +340,16 @@ private:
                                    CONFIG_RESPEAKER_XVF3800_CONTROL_POLL_MS - 1) /
                                       CONFIG_RESPEAKER_XVF3800_CONTROL_POLL_MS));
     static_assert(kWindowPolls <= 64, "window must fit in the 64-bit history");
+    // Fast path: a few loud polls in the same window. XMOS post-processing chops a
+    // near-end talker into short bursts during playback, which can starve the window.
+    // Its own, shorter window: a knock is one loud poll, a word is several in a row.
+    static constexpr int kStrongWindowPolls = std::max(
+        1, std::min(64, (CONFIG_RESPEAKER_XVF3800_BARGE_IN_STRONG_WINDOW_MS > 0
+                             ? CONFIG_RESPEAKER_XVF3800_BARGE_IN_STRONG_WINDOW_MS
+                             : CONFIG_RESPEAKER_XVF3800_BARGE_IN_WINDOW_MS) /
+                            CONFIG_RESPEAKER_XVF3800_CONTROL_POLL_MS));
+    static constexpr int kStrongPolls =
+        std::max(1, std::min(kStrongWindowPolls, CONFIG_RESPEAKER_XVF3800_BARGE_IN_STRONG_POLLS));
 #endif
 #if CONFIG_RESPEAKER_XVF3800_CONTROL_DIAGNOSTICS
     static constexpr bool kDiagnostics = true;
@@ -366,10 +376,12 @@ private:
         const float threshold = strtof(CONFIG_RESPEAKER_XVF3800_BARGE_IN_THRESHOLD, nullptr);
         ESP_LOGI(kTag,
                  "XVF3800 barge-in: speech energy > %g with input rms >= %d, or input rms > %d, in %d of "
-                 "the last %d polls (%d ms), %d ms grace",
+                 "the last %d polls (%d ms), or input rms > %d in %d of the last %d polls (0 = off), "
+                 "%d ms grace",
                  static_cast<double>(threshold), CONFIG_RESPEAKER_XVF3800_BARGE_IN_MIN_RMS,
                  CONFIG_RESPEAKER_XVF3800_BARGE_IN_INPUT_RMS, kHoldPolls, kWindowPolls,
-                 CONFIG_RESPEAKER_XVF3800_CONTROL_POLL_MS, CONFIG_RESPEAKER_XVF3800_BARGE_IN_GRACE_MS);
+                 CONFIG_RESPEAKER_XVF3800_CONTROL_POLL_MS, CONFIG_RESPEAKER_XVF3800_BARGE_IN_STRONG_RMS,
+                 kStrongPolls, kStrongWindowPolls, CONFIG_RESPEAKER_XVF3800_BARGE_IN_GRACE_MS);
 #endif
 
         auto& app = Application::GetInstance();
@@ -380,10 +392,12 @@ private:
             if (!speaking) {
                 speaking_since_us_ = 0;
                 history_ = 0;
+                strong_history_ = 0;
                 armed_ = true;
             } else if (speaking_since_us_ == 0) {
                 speaking_since_us_ = now;
                 history_ = 0;
+                strong_history_ = 0;
             }
             const bool report =
                 kDiagnostics && now - last_report_us_ >= (speaking ? 200000 : 500000);
@@ -409,15 +423,31 @@ private:
                     CONFIG_RESPEAKER_XVF3800_BARGE_IN_INPUT_RMS > 0 &&
                     input_rms > static_cast<uint32_t>(CONFIG_RESPEAKER_XVF3800_BARGE_IN_INPUT_RMS);
                 const bool speech = energy_vote || level_vote;
+                const bool strong =
+                    CONFIG_RESPEAKER_XVF3800_BARGE_IN_STRONG_RMS > 0 &&
+                    input_rms > static_cast<uint32_t>(CONFIG_RESPEAKER_XVF3800_BARGE_IN_STRONG_RMS);
                 history_ = (history_ << 1) | (speech ? 1ULL : 0ULL);
+                strong_history_ = (strong_history_ << 1) | (strong ? 1ULL : 0ULL);
                 if (kWindowPolls < 64) {
                     history_ &= (1ULL << kWindowPolls) - 1;
                 }
-                if (__builtin_popcountll(history_) >= kHoldPolls) {
+                if (kStrongWindowPolls < 64) {
+                    strong_history_ &= (1ULL << kStrongWindowPolls) - 1;
+                }
+                const bool fast = __builtin_popcountll(strong_history_) >= kStrongPolls;
+                if (fast || __builtin_popcountll(history_) >= kHoldPolls) {
                     armed_ = false;
                     history_ = 0;
-                    BargeIn(energy, input_rms);
+                    strong_history_ = 0;
+                    BargeIn(energy, input_rms, fast);
                 }
+            }
+#endif
+#if CONFIG_RESPEAKER_XVF3800_BARGE_IN_TRACE
+            if (speaking) {
+                ESP_LOGI(kTag, "XVF3800 poll +%lld rms=%u peak=%.3g",
+                         static_cast<long long>((now - speaking_since_us_) / 1000),
+                         static_cast<unsigned>(input_rms), static_cast<double>(peak));
             }
 #endif
             if (report) {
@@ -493,12 +523,12 @@ private:
     }
 
 #if CONFIG_RESPEAKER_XVF3800_BARGE_IN
-    void BargeIn(const float* energy, uint32_t input_rms) {
+    void BargeIn(const float* energy, uint32_t input_rms, bool fast) {
         ESP_LOGI(kTag,
-                 "XVF3800 near-end speech during playback (spenergy %.3g/%.3g/%.3g/%.3g, input rms %u); aborting",
+                 "XVF3800 near-end speech during playback (spenergy %.3g/%.3g/%.3g/%.3g, input rms %u, %s); aborting",
                  static_cast<double>(energy[0]), static_cast<double>(energy[1]),
                  static_cast<double>(energy[2]), static_cast<double>(energy[3]),
-                 static_cast<unsigned>(input_rms));
+                 static_cast<unsigned>(input_rms), fast ? "loud polls" : "speech window");
         // Same steps as the server's "tts stop" plus the wake-word path's queue flush,
         // executed in the main task: tell the server, drop queued audio, start listening.
         Application::GetInstance().Schedule([]() {
@@ -517,6 +547,7 @@ private:
     uint8_t doa_cmd_ = 0;
     int64_t speaking_since_us_ = 0;
     uint64_t history_ = 0;  // one bit per poll, 1 = speech energy above threshold
+    uint64_t strong_history_ = 0;  // one bit per poll, 1 = input rms above STRONG_RMS
     int64_t last_report_us_ = 0;
     bool armed_ = true;
 };

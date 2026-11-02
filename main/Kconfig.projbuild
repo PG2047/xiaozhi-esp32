@@ -724,6 +724,57 @@ config RESPEAKER_XVF3800_BARGE_IN_MIN_RMS
         Requiring the processed input to carry some level at the same time
         rejects those; a real near-end talker reaches hundreds to thousands.
 
+config RESPEAKER_XVF3800_BARGE_IN_STRONG_RMS
+    int "ReSpeaker: input RMS (16-bit) that interrupts after only a few polls (0 = off)"
+    depends on RESPEAKER_XVF3800_BARGE_IN
+    range 0 32767
+    default 0
+    help
+        Fast path next to the speech-poll window. During playback the XMOS
+        post-processing chops near-end speech into short bursts, so a talker
+        at about a metre can fail to add up RESPEAKER_XVF3800_BARGE_IN_HOLD_MS
+        even though the loud part of a word stands well above the residual
+        echo. When RESPEAKER_XVF3800_BARGE_IN_STRONG_POLLS polls within
+        RESPEAKER_XVF3800_BARGE_IN_STRONG_WINDOW_MS see the processed input
+        above this level, the reply is interrupted at once. On a reSpeaker
+        XVF3800 at volume 70 with the AGC frozen at 4, single polls of residual
+        echo reached 1437 RMS over 100 s of quiet playback and 2774 right after
+        a barge-in, while the loud part of a barge-in phrase ran 2000..6700 on
+        consecutive polls.
+
+config RESPEAKER_XVF3800_BARGE_IN_STRONG_POLLS
+    int "ReSpeaker: polls above STRONG_RMS that trigger the fast path"
+    depends on RESPEAKER_XVF3800_BARGE_IN
+    range 1 64
+    default 2
+    help
+        Counted over RESPEAKER_XVF3800_BARGE_IN_STRONG_WINDOW_MS (the speech
+        window when that is 0) and capped at its length. One poll is enough to
+        be cut by a knock on the table.
+
+config RESPEAKER_XVF3800_BARGE_IN_STRONG_WINDOW_MS
+    int "ReSpeaker: window for the fast path's loud polls (ms, 0 = same as the speech window)"
+    depends on RESPEAKER_XVF3800_BARGE_IN
+    range 0 4000
+    default 0
+    help
+        On a reSpeaker XVF3800 a knock on the table showed up as one loud poll
+        that had decayed below 2000 RMS by the next poll, and two knocks 0.8 s
+        apart both fell inside the 600 ms (12-poll) speech window. The loud
+        part of a spoken word spanned consecutive polls in every recorded
+        barge-in, so a window of a few polls keeps the fast path for speech
+        while isolated knocks no longer add up.
+
+config RESPEAKER_XVF3800_BARGE_IN_TRACE
+    bool "ReSpeaker: log every barge-in poll while speaking (evaluation only)"
+    depends on RESPEAKER_XVF3800_BARGE_IN
+    default n
+    help
+        One short line per poll with the time since the reply started, the
+        processed-input RMS and the largest speech energy, so that a recorded
+        test session can be replayed offline against other vote rules. About
+        20 lines per second during playback; keep it off in normal builds.
+
 config RESPEAKER_XVF3800_BARGE_IN_HOLD_MS
     int "ReSpeaker: near-end speech must add up to this long (ms)"
     depends on RESPEAKER_XVF3800_BARGE_IN
