@@ -389,8 +389,11 @@ private:
         std::max(1, std::min(kStrongWindowPolls, CONFIG_RESPEAKER_XVF3800_BARGE_IN_STRONG_POLLS));
     // Voicing: XMOS reports speech energy on keystrokes as well, but a vowel repeats at
     // its pitch period and a keystroke dies away within one or two. Largest r(lag) / r(0)
-    // over 32 ms frames, lags of 2..12.5 ms (500..80 Hz).
+    // over 32 ms frames, lags of 2..12.5 ms (500..80 Hz), as is and scaled for the shorter
+    // overlap at longer lags.
     static constexpr int kVoicedPolls = CONFIG_RESPEAKER_XVF3800_BARGE_IN_VOICED_POLLS;
+    static_assert(kVoicedPolls <= kWindowPolls,
+                  "VOICED_POLLS counts polls of the speech window (WINDOW_MS / CONTROL_POLL_MS)");
     static constexpr int kVoicingFrame = 512;
     static constexpr int kVoicingHop = 256;
     static constexpr int kVoicingMinLag = 32;
@@ -459,10 +462,12 @@ private:
                  CONFIG_RESPEAKER_XVF3800_CONTROL_POLL_MS, CONFIG_RESPEAKER_XVF3800_BARGE_IN_STRONG_RMS,
                  kStrongPolls, kStrongWindowPolls, CONFIG_RESPEAKER_XVF3800_BARGE_IN_GRACE_MS);
         const float voicing_threshold = strtof(CONFIG_RESPEAKER_XVF3800_BARGE_IN_VOICING, nullptr);
+        const float scaled_threshold = strtof(CONFIG_RESPEAKER_XVF3800_BARGE_IN_VOICING_UNBIASED, nullptr);
         ESP_LOGI(kTag,
-                 "XVF3800 barge-in voicing: interrupt only with %d voiced polls (periodicity >= %g) "
-                 "among the last %d (0 = off)",
-                 kVoicedPolls, static_cast<double>(voicing_threshold), kWindowPolls);
+                 "XVF3800 barge-in voicing: interrupt only with %d voiced polls (periodicity >= %g, or >= %g "
+                 "scaled for the overlap, 0 = off) among the last %d (0 = off)",
+                 kVoicedPolls, static_cast<double>(voicing_threshold), static_cast<double>(scaled_threshold),
+                 kWindowPolls);
 #endif
 #if CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK
         ESP_LOGI(kTag,
@@ -561,6 +566,7 @@ private:
 #endif
 #if CONFIG_RESPEAKER_XVF3800_BARGE_IN
             [[maybe_unused]] float voicing = -1.0f;  // not computed
+            [[maybe_unused]] float voicing_scaled = -1.0f;
             [[maybe_unused]] int voicing_us = 0;
 #if CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK
             // A burst carried over from the previous segment is still being spoken: no grace.
@@ -590,10 +596,13 @@ private:
                 // voiced polls among the window's speech polls.
                 if (speech && (kVoicedPolls > 0 || kTrace)) {
                     const int64_t started = esp_timer_get_time();
-                    voicing = Voicing();
+                    Voicing(&voicing, &voicing_scaled);
                     voicing_us = static_cast<int>(esp_timer_get_time() - started);
                 }
-                const bool voiced = speech && voicing >= voicing_threshold;
+                // A low voice repeats at a long lag, where r(lag) / r(0) cannot reach the
+                // threshold (below 0.75 for pitch under 125 Hz); the scaled score can.
+                const bool voiced = speech && (voicing >= voicing_threshold ||
+                                               (scaled_threshold > 0.0f && voicing_scaled >= scaled_threshold));
                 history_ = (history_ << 1) | (speech ? 1ULL : 0ULL);
                 strong_history_ = (strong_history_ << 1) | (strong ? 1ULL : 0ULL);
                 voiced_history_ = (voiced_history_ << 1) | (voiced ? 1ULL : 0ULL);
@@ -684,11 +693,12 @@ private:
                 // The rest covers every chunk since the previous poll: count, RMS, loudest
                 // chunk, chunks of at least MIN_RMS, largest |sample|, high-frequency weight
                 // (difference energy over energy, percent), sign changes per 1000 samples and,
-                // on speech polls, the voicing in percent (-1 = not computed) and its CPU time.
+                // on speech polls, the voicing in percent (-1 = not computed), its CPU time and,
+                // after the duck tag, the voicing scaled for the overlap.
                 const uint64_t samples = std::max<uint32_t>(shape.samples, 1);
                 ESP_LOGI(kTag,
                          "XVF3800 poll +%lld rms=%u peak=%.3g n=%u avg=%u max=%u loud=%u pk=%u hf=%u zc=%u voi=%d "
-                         "vus=%d%s",
+                         "vus=%d%s vu=%d",
                          static_cast<long long>((now - speaking_since_us_) / 1000),
                          static_cast<unsigned>(input_rms), static_cast<double>(peak),
                          static_cast<unsigned>(shape.chunks),
@@ -697,7 +707,8 @@ private:
                          static_cast<unsigned>(shape.peak),
                          static_cast<unsigned>(shape.square_sum == 0 ? 0 : shape.diff_square_sum * 100 / shape.square_sum),
                          static_cast<unsigned>(shape.crossings * 1000ULL / samples),
-                         voicing < 0.0f ? -1 : static_cast<int>(voicing * 100.0f), voicing_us, duck_tag);
+                         voicing < 0.0f ? -1 : static_cast<int>(voicing * 100.0f), voicing_us, duck_tag,
+                         voicing_scaled < 0.0f ? -1 : static_cast<int>(voicing_scaled * 100.0f));
             }
 #endif
             if (report) {
@@ -891,8 +902,11 @@ private:
     // Largest r(lag) / r(0) over recent_, in 512-sample frames stepping back from the newest
     // sample by kVoicingHop, for lags of kVoicingMinLag..kVoicingMaxLag. Each lag sums over
     // the frame's overlap with itself, so a sound that dies away within the lag scores low.
-    float Voicing() {
+    // *scaled is the same with r(lag) scaled to the whole frame (at most 1): a periodic frame
+    // scores about 1 at any pitch, where r(lag) / r(0) stays below overlap / kVoicingFrame.
+    void Voicing(float* biased, float* scaled) {
         float best = 0.0f;
+        float best_scaled = 0.0f;
         for (int start = recent_count_ - kVoicingFrame; start >= 0; start -= kVoicingHop) {
             float mean = 0.0f;
             for (int i = 0; i < kVoicingFrame; ++i) {
@@ -925,10 +939,13 @@ private:
                 for (; i < count; ++i) {
                     r += head[i] * tail[i];
                 }
-                best = std::max(best, r / r0);
+                const float ratio = r / r0;
+                best = std::max(best, ratio);
+                best_scaled = std::max(best_scaled, std::min(1.0f, ratio * kVoicingFrame / count));
             }
         }
-        return best;
+        *biased = best;
+        *scaled = best_scaled;
     }
 
     void BargeIn(const float* energy, int voiced_polls, uint32_t input_rms, const char* path) {

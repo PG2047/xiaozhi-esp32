@@ -899,17 +899,22 @@ config RESPEAKER_XVF3800_BARGE_IN_VOICED_POLLS
         playback and interrupted replies while nobody spoke, at least four
         times in five minutes, at input levels as high as a spoken command's.
         Each speech poll also
-        measures how periodic its input is (RESPEAKER_XVF3800_BARGE_IN_VOICING),
-        and both the speech window and a ducked burst interrupt the reply only
-        once this many of the polls in the speech window are voiced; the fast
-        path still ducks without it. This buys margin, not a clean split: that
-        keyboard rings at about 170 Hz for up to 100 ms after a keystroke,
-        which scored 0.27..0.79 against 0.37..0.91 for a stop phrase spoken
-        during playback (the XMOS double-talk processing chops near-end
-        speech). Replaying recordings with 2 polls at 0.75, 22 s of that
-        typing no longer interrupted the reply (4 times with this option off)
-        and the stop phrase still interrupted at the same poll. Tune both
-        values again for another keyboard or room.
+        measures how periodic its input is (RESPEAKER_XVF3800_BARGE_IN_VOICING
+        and RESPEAKER_XVF3800_BARGE_IN_VOICING_UNBIASED), and both the speech
+        window and a ducked burst interrupt the reply only once this many of
+        the polls in the speech window are voiced; the fast path still ducks
+        without it. This buys margin, not a clean split: that keyboard rings
+        at about 170 Hz for up to 100 ms after a keystroke, as periodic as a
+        voice of that pitch, and stop phrases spoken during playback while
+        typing had a single voiced poll. The reSpeaker XVF3800 config.json
+        uses 1 and keeps more of the user's stop phrases at the cost of some
+        typing: replaying 191 s of typing and 7 stop phrases recorded during
+        playback on 11-03 (voiced at 0.75 or 0.95 scaled), typing interrupted
+        4 times (none in 117 s of ordinary typing, 4 in 44 s of heavy typing;
+        12 without voiced polls) and 4 of the 7 stop phrases interrupted, 3 of
+        them about 0.55 s after their first speech poll; 2 voiced polls at 0.75
+        caught 1 of the 7. At most the number of polls in
+        RESPEAKER_XVF3800_BARGE_IN_WINDOW_MS; the build fails above it.
 
 config RESPEAKER_XVF3800_BARGE_IN_VOICING
     string "ReSpeaker: periodicity that makes a speech poll voiced"
@@ -920,9 +925,30 @@ config RESPEAKER_XVF3800_BARGE_IN_VOICING
         20 ms before it, in 32 ms frames stepping back from the newest sample
         by 16 ms, for lags of 2..12.5 ms (pitch 80..500 Hz); r(lag) sums over
         the frame's overlap with itself, so a sound that dies away within the
-        lag scores low. Computed on speech polls only: on the reSpeaker
-        XVF3800 (size-optimised build) about 5 ms per speech poll, at most
-        9 ms, and the poll interval during playback stayed at about 70 ms.
+        lag scores low, and a periodic sound cannot pass (512 - lag) / 512:
+        0.75 at 125 Hz, 0.69 at 100 Hz (see
+        RESPEAKER_XVF3800_BARGE_IN_VOICING_UNBIASED). Computed on speech polls
+        only: on the reSpeaker XVF3800 (size-optimised build) about 5 ms per
+        speech poll, at most 9 ms, and the poll interval during playback
+        stayed at about 70 ms.
+
+config RESPEAKER_XVF3800_BARGE_IN_VOICING_UNBIASED
+    string "ReSpeaker: periodicity scaled for the overlap that also makes a speech poll voiced (0 = off)"
+    depends on RESPEAKER_XVF3800_BARGE_IN
+    default "0"
+    help
+        The score of RESPEAKER_XVF3800_BARGE_IN_VOICING with r(lag) scaled to
+        the whole frame, 512 / (512 - lag), at most 1: a periodic frame scores
+        about 1 at any pitch. A poll is voiced when either score reaches its
+        threshold. On 11-03 clean recordings of a stop phrase in four male
+        macOS voices (86..119 Hz) peaked at 0.66..0.75 unscaled, and 3..5 of
+        their 16..17 polls reached 0.95 scaled. In the recordings of typing
+        and stop phrases during playback, adding it at 0.95 changed no
+        decision: the user's own voice (about 140 Hz) passes 0.75 through a
+        single strong harmonic, and the keyboard reached 0.97 scaled either way.
+        On the board, two stop phrases in a male macOS voice played during a
+        story interrupted only through it (0.73 and 0.72 unscaled, 1.00 and
+        0.97 scaled).
 
 config RESPEAKER_XVF3800_BARGE_IN_LOG_ONLY
     bool "ReSpeaker: log barge-in decisions without interrupting (evaluation only)"
@@ -994,7 +1020,11 @@ config RESPEAKER_XVF3800_BARGE_IN_HOLD_MS
         51 s of playback, so a window rather than a consecutive run is used.
         The reSpeaker XVF3800 config.json uses 400 (8 of 12 polls): the ringing
         of two quick knocks on the table filled 6 polls with speech energy,
-        while every recorded barge-in was caught by the fast path first.
+        while every recorded barge-in was caught by the fast path first. On
+        11-03 a stop phrase spoken during a story without typing filled only 7
+        (the XMOS double-talk processing chops near-end speech); 350 (7 of 12)
+        caught it, but twice took the board's own voice leaking back after 15 s
+        of loud synthetic typing for a stop phrase, so it stays at 400.
 
 config RESPEAKER_XVF3800_BARGE_IN_WINDOW_MS
     int "ReSpeaker: sliding window for counting speech polls (ms)"
