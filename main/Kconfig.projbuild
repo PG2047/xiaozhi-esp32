@@ -727,6 +727,23 @@ config RESPEAKER_XVF3800_BARGE_IN_MIN_RMS
         Requiring the processed input to carry some level at the same time
         rejects those; a real near-end talker reaches hundreds to thousands.
 
+config RESPEAKER_XVF3800_BARGE_IN_LOUDEST_CHUNK
+    bool "ReSpeaker: the MIN_RMS check of a speech-energy vote uses the loudest chunk since the previous poll"
+    depends on RESPEAKER_XVF3800_BARGE_IN
+    default n
+    help
+        A poll sees the input as one 10 ms chunk in about seven. During playback
+        the XMOS double-talk processing chops near-end speech into fragments, so
+        on 11-03 polls with speech energy during a stop phrase often found the
+        latest chunk between two fragments (26..136 RMS) while the chunks since
+        the previous poll reached 400..2700. With this option the check takes
+        the louder of the latest chunk and the loudest chunk since the previous
+        poll. The fast path still looks at the latest chunk only. It also turns
+        stray fragments into votes: on 11-03, replaying the same 10 minutes of
+        playback (stories, typing, backchannels, a quiet story) gave 8 false
+        interruptions with this option against 2 without it, so the reSpeaker
+        XVF3800 config.json leaves it off.
+
 config RESPEAKER_XVF3800_BARGE_IN_STRONG_RMS
     int "ReSpeaker: input RMS (16-bit) that interrupts after only a few polls (0 = off)"
     depends on RESPEAKER_XVF3800_BARGE_IN
@@ -799,6 +816,24 @@ config RESPEAKER_XVF3800_BARGE_IN_DUCK_PERCENT
         reaches the loudspeaker behind the queued DMA audio (90 ms) and the
         frame being written (up to 60 ms).
 
+config RESPEAKER_XVF3800_BARGE_IN_DUCK_SPEECH_POLLS
+    int "ReSpeaker: speech polls among the fast path's last polls that also duck the reply (0 = loud polls only)"
+    depends on RESPEAKER_XVF3800_BARGE_IN_DUCK
+    range 0 64
+    default 0
+    help
+        The fast path only ducks on polls above RESPEAKER_XVF3800_BARGE_IN_STRONG_RMS,
+        which a soft talker never reaches during playback. With this option the
+        reply is also ducked once this many of the last
+        RESPEAKER_XVF3800_BARGE_IN_STRONG_WINDOW_MS polls are speech polls: less
+        echo reaches the XMOS while the talker goes on, so its double-talk
+        processing chops less of the rest of the phrase. Typing next to the board
+        ducks more often as well (it never interrupts by itself, see
+        RESPEAKER_XVF3800_BARGE_IN_VOICED_POLLS). Replaying the polls of 11-03
+        with the XMOS at its factory post-processing values, 2 of 4 caught none
+        of the soft stop phrases (Mac at volume 8) that went undetected during
+        a story, so the reSpeaker XVF3800 config.json leaves it at 0.
+
 config RESPEAKER_XVF3800_BARGE_IN_DUCK_CONFIRM_POLLS
     int "ReSpeaker: speech polls in a ducked burst that interrupt the reply (0 = speech window only)"
     depends on RESPEAKER_XVF3800_BARGE_IN_DUCK
@@ -819,7 +854,12 @@ config RESPEAKER_XVF3800_BARGE_IN_DUCK_RELEASE_MS
         Measured in real time, not in polls. Longer than the pause after
         "xiao zhi," in a synthetic stop phrase (about 290 ms), so the command
         stays one burst; when a burst ends without interrupting, the volume
-        ramps back. A reply segment that ends within this time of the last
+        ramps back. During continuous playback the XMOS double-talk processing
+        also drops the speech polls next to that pause: on 11-03 the last
+        speech poll of "xiao zhi" and the first of "stop" were 420..480 ms
+        apart while a story played, so with 400 the count started again and
+        the reply was interrupted about 1.5 s after the onset; the reSpeaker
+        XVF3800 config.json uses 600. A reply segment that ends within this time of the last
         speech poll does not end the burst: the next segment is counted
         without RESPEAKER_XVF3800_BARGE_IN_GRACE_MS (a stop phrase that began
         in the gap between two GPT-Live segments lost four loud polls to the
@@ -889,6 +929,22 @@ config RESPEAKER_XVF3800_BARGE_IN_LOG_ONLY
         and the reply keeps playing (the fast path still ducks it). Used to
         record a long stretch of a noise source next to the board during
         playback, for example typing, and replay it offline.
+
+config RESPEAKER_XVF3800_TUNE_UDP_PORT
+    int "ReSpeaker: UDP port for live XVF3800 tuning commands (0 = off, evaluation only)"
+    depends on RESPEAKER_XVF3800_BARGE_IN
+    range 0 65535
+    default 0
+    help
+        Listens on this port for one-line commands from the local network and
+        logs the result: "r <resid> <cmd> <f|i|u>[count]" reads a control
+        parameter (float, int32 or uint8), "w <resid> <cmd> <f|i|u> <v1> [v2]
+        [v3]" writes up to three values and reads them back (PP_MGSCALE,
+        resource 17 / command 29, is three floats; "w 48 7 u 1" reboots the
+        XMOS, which then needs the boot-time overrides again), and "duck <n>" sets
+        RESPEAKER_XVF3800_BARGE_IN_DUCK_SPEECH_POLLS. Anyone on
+        the network can change the DSP, so keep it at 0 outside test builds.
+        Written XMOS values stay until the XMOS is power-cycled or rebooted.
 
 config RESPEAKER_XVF3800_ECHO_GUARD
     bool "ReSpeaker: reboot the XMOS when replies keep starting with near-full-scale echo"
@@ -978,7 +1034,27 @@ config RESPEAKER_XVF3800_PP_FMIN_SPEINDEX
     help
         Below this frequency the XVF3800 suppresses near-end speech harder during
         double-talk (resource 17, command 30, float, XMOS default 593.75; the
-        Seeed firmware ships 1300). Re-sent at every boot.
+        Seeed firmware ships 1300). Re-sent at every boot. An empty value does
+        not undo a value written earlier: the XMOS keeps it until power-cycled.
+        On 11-03 the XMOS default (593.75) let residual echo through during a
+        story (65 speech polls and 2 interruptions in 20 s of quiet playback)
+        without making a soft stop phrase detectable.
+
+config RESPEAKER_XVF3800_PP_MGSCALE
+    string "ReSpeaker: PP_MGSCALE (\"max min\") to write at boot (empty = leave the XMOS value)"
+    depends on RESPEAKER_XVF3800_BARGE_IN || RESPEAKER_XVF3800_CONTROL_DIAGNOSTICS
+    default ""
+    help
+        Extra noise suppression the XVF3800 applies while the far end (the
+        loudspeaker) is active (resource 17, command 29, three floats: max, min,
+        in use). The XMOS tuning guide starts from 1 1 1 and raises max (typical
+        100..1000, min equal to max) until the residual echo stops improving;
+        more suppression also removes more near-end speech during playback.
+        Re-sent at every boot; the value in use is written equal to min. The
+        Seeed I2S firmware v1.0.4 ships 1000 1 1. On 11-03, max 100 or 1 let
+        residual echo through during a story (19 and 41 speech polls in 20 s of
+        quiet playback, against none) and still did not make a soft stop phrase
+        (Mac at volume 8) detectable, so the reSpeaker XVF3800 leaves it alone.
 
 config RESPEAKER_XVF3800_PP_AGC_FIXED_GAIN
     string "ReSpeaker: freeze the XVF3800 AGC at this gain (empty = leave the AGC adaptive)"

@@ -18,9 +18,16 @@
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+
+#if CONFIG_RESPEAKER_XVF3800_TUNE_UDP_PORT
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -310,14 +317,15 @@ uint32_t LogXvf3800Settings(Xvf3800Control& control) {
         {"PP_MIN_NS", 17, 21, 'f', 1},          {"PP_MIN_NN", 17, 22, 'f', 1},
         {"PP_ECHOONOFF", 17, 23, 'i', 1},       {"PP_GAMMA_E", 17, 24, 'f', 1},
         {"PP_GAMMA_ETAIL", 17, 25, 'f', 1},     {"PP_GAMMA_ENL", 17, 26, 'f', 1},
-        {"PP_NLATTENONOFF", 17, 27, 'i', 1},    {"PP_FMIN_SPEINDEX", 17, 30, 'f', 1},
-        {"PP_DTSENSITIVE", 17, 31, 'i', 1},     {"PP_ATTNS_MODE", 17, 32, 'i', 1},
+        {"PP_NLATTENONOFF", 17, 27, 'i', 1},    {"PP_MGSCALE", 17, 29, 'f', 3},
+        {"PP_FMIN_SPEINDEX", 17, 30, 'f', 1},   {"PP_DTSENSITIVE", 17, 31, 'i', 1},
+        {"PP_ATTNS_MODE", 17, 32, 'i', 1},
     };
     for (const Setting& setting : kSettings) {
         union {
-            float f[2];
-            int32_t i[2];
-            uint8_t u[8];
+            float f[3];
+            int32_t i[3];
+            uint8_t u[12];
         } value = {};
         const size_t length = setting.type == 'u' ? setting.count : setting.count * 4U;
         if (!control.Read(setting.resid, setting.cmd, &value, length)) {
@@ -325,7 +333,11 @@ uint32_t LogXvf3800Settings(Xvf3800Control& control) {
             continue;
         }
         char text[48] = {};
-        if (setting.type == 'f') {
+        if (setting.type == 'f' && setting.count == 3) {
+            // PP_MGSCALE: max, min and the value in use
+            snprintf(text, sizeof(text), "%g, %g, %g", static_cast<double>(value.f[0]),
+                     static_cast<double>(value.f[1]), static_cast<double>(value.f[2]));
+        } else if (setting.type == 'f') {
             snprintf(text, sizeof(text), "%g", static_cast<double>(value.f[0]));
         } else if (setting.type == 'i') {
             snprintf(text, sizeof(text), "%d", static_cast<int>(value.i[0]));
@@ -415,6 +427,11 @@ private:
 #else
     static constexpr bool kTrace = false;
 #endif
+#if CONFIG_RESPEAKER_XVF3800_BARGE_IN_LOUDEST_CHUNK
+    static constexpr bool kLoudestChunk = true;
+#else
+    static constexpr bool kLoudestChunk = false;
+#endif
 
     void Run() {
         // Give the XMOS time to boot its own firmware before the first control read.
@@ -449,10 +466,12 @@ private:
 #endif
 #if CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK
         ESP_LOGI(kTag,
-                 "XVF3800 barge-in duck: the fast path ducks the reply to %d%%; interrupt after %d speech "
-                 "polls in the ducked burst (0 = speech window only), volume back after %d ms without speech",
-                 CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK_PERCENT, kDuckConfirmPolls,
-                 CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK_RELEASE_MS);
+                 "XVF3800 barge-in duck: the fast path (or %d speech polls of its last %d, 0 = off) ducks the "
+                 "reply to %d%%; interrupt after %d speech polls in the ducked burst (0 = speech window only), "
+                 "volume back after %d ms without speech; speech votes check the %s chunk",
+                 duck_speech_polls_, kStrongWindowPolls, CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK_PERCENT,
+                 kDuckConfirmPolls, CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK_RELEASE_MS,
+                 kLoudestChunk ? "loudest" : "latest");
 #endif
 #if CONFIG_RESPEAKER_XVF3800_ECHO_GUARD
         ESP_LOGI(kTag,
@@ -465,6 +484,9 @@ private:
         auto& app = Application::GetInstance();
         while (true) {
             vTaskDelay(pdMS_TO_TICKS(CONFIG_RESPEAKER_XVF3800_CONTROL_POLL_MS));
+#if CONFIG_RESPEAKER_XVF3800_TUNE_UDP_PORT
+            PollTuneCommand();
+#endif
             const int64_t now = esp_timer_get_time();
             const bool speaking = app.GetDeviceState() == kDeviceStateSpeaking;
 #if CONFIG_RESPEAKER_XVF3800_BARGE_IN
@@ -495,6 +517,7 @@ private:
                 strong_history_ = 0;
                 voiced_history_ = 0;
 #if CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK
+                duck_history_ = 0;
                 // GPT-Live's replies arrive as segments split at 0.7 s of silence, so a segment
                 // can end in the middle of a ducked burst; the burst then carries over a short gap
                 // and the next segment starts ducked. After an interruption, or once the burst
@@ -511,6 +534,9 @@ private:
                 history_ = 0;
                 strong_history_ = 0;
                 voiced_history_ = 0;
+#if CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK
+                duck_history_ = 0;
+#endif
             }
             const bool report =
                 kDiagnostics && now - last_report_us_ >= (speaking ? 200000 : 500000);
@@ -544,9 +570,10 @@ private:
             const bool counting = now - speaking_since_us_ >= kGraceUs;
 #endif
             if (speaking && armed_ && counting) {
+                const uint32_t vote_rms = kLoudestChunk ? std::max(input_rms, shape.max_chunk_rms) : input_rms;
                 const bool energy_vote =
                     peak > threshold &&
-                    input_rms >= static_cast<uint32_t>(CONFIG_RESPEAKER_XVF3800_BARGE_IN_MIN_RMS);
+                    vote_rms >= static_cast<uint32_t>(CONFIG_RESPEAKER_XVF3800_BARGE_IN_MIN_RMS);
                 const bool level_vote =
                     CONFIG_RESPEAKER_XVF3800_BARGE_IN_INPUT_RMS > 0 &&
                     input_rms > static_cast<uint32_t>(CONFIG_RESPEAKER_XVF3800_BARGE_IN_INPUT_RMS);
@@ -590,15 +617,25 @@ private:
                     ++burst_polls_;
                     last_speech_us_ = now;
                 }
-                if (fast && !ducked_) {
+                // A soft talker never reaches STRONG_RMS during playback: a few speech polls within
+                // the fast path's window duck too, so less echo reaches the XMOS for the rest of
+                // the phrase.
+                duck_history_ = (duck_history_ << 1) | (speech ? 1ULL : 0ULL);
+                if (kStrongWindowPolls < 64) {
+                    duck_history_ &= (1ULL << kStrongWindowPolls) - 1;
+                }
+                const bool speech_run = duck_speech_polls_ > 0 &&
+                                        __builtin_popcountll(duck_history_) >= duck_speech_polls_;
+                if ((fast || speech_run) && !ducked_) {
                     strong_history_ = 0;  // a second loud burst ducks again, it does not escalate
+                    duck_history_ = 0;
                     duck_since_us_ = now;
                     SetDucked(true);
                     ESP_LOGI(kTag,
-                             "XVF3800 loud near-end during playback (input rms %u, speech poll %d of the "
-                             "burst); ducking to %d%%",
-                             static_cast<unsigned>(input_rms), burst_polls_,
-                             CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK_PERCENT);
+                             "XVF3800 %s during playback (input rms %u, speech poll %d of the burst); "
+                             "ducking to %d%%",
+                             fast ? "loud near-end" : "near-end speech polls", static_cast<unsigned>(input_rms),
+                             burst_polls_, CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK_PERCENT);
                 }
                 const bool confirmed =
                     ducked_ && kDuckConfirmPolls > 0 && burst_polls_ >= kDuckConfirmPolls;
@@ -606,6 +643,7 @@ private:
                     history_ = 0;
                     strong_history_ = 0;
                     voiced_history_ = 0;
+                    duck_history_ = 0;
                     BargeIn(energy, voiced_polls, input_rms, window ? "speech window" : "ducked burst");
 #if CONFIG_RESPEAKER_XVF3800_BARGE_IN_LOG_ONLY
                     // The reply goes on: count the next burst from scratch, at full volume.
@@ -701,6 +739,20 @@ private:
                      static_cast<double>(gain), static_cast<double>(gain_back),
                      static_cast<int>(on_back), ok && on_back == 0 ? "ok" : "FAILED");
         }
+        if (CONFIG_RESPEAKER_XVF3800_PP_MGSCALE[0] != '\0') {
+            float scale[3] = {};
+            char* rest = nullptr;
+            scale[0] = strtof(CONFIG_RESPEAKER_XVF3800_PP_MGSCALE, &rest);
+            scale[1] = strtof(rest, nullptr);
+            scale[2] = scale[1];
+            float readback[3] = {NAN, NAN, NAN};
+            const bool ok = control_.Write(Xvf3800Control::kResPp, 29, scale, sizeof(scale)) &&
+                            control_.Read(Xvf3800Control::kResPp, 29, readback, sizeof(readback));
+            ESP_LOGI(kTag, "XVF3800 PP_MGSCALE := %g %g (read back %g %g %g, %s)", static_cast<double>(scale[0]),
+                     static_cast<double>(scale[1]), static_cast<double>(readback[0]),
+                     static_cast<double>(readback[1]), static_cast<double>(readback[2]),
+                     ok && readback[0] == scale[0] && readback[1] == scale[1] ? "ok" : "FAILED");
+        }
         if (CONFIG_RESPEAKER_XVF3800_PP_FMIN_SPEINDEX[0] != '\0') {
             const float value = strtof(CONFIG_RESPEAKER_XVF3800_PP_FMIN_SPEINDEX, nullptr);
             float readback = NAN;
@@ -742,6 +794,97 @@ private:
         ducked_ = ducked;
         g_output_duck_q16.store(ducked ? kDuckQ16 : 65536, std::memory_order_relaxed);
     }
+#endif
+
+#if CONFIG_RESPEAKER_XVF3800_TUNE_UDP_PORT
+    // Evaluation only (see RESPEAKER_XVF3800_TUNE_UDP_PORT): at most one command per poll,
+    // run in this task because it owns the control interface.
+    void PollTuneCommand() {
+        if (tune_socket_ < 0) {
+            const int sock = socket(AF_INET, SOCK_DGRAM, 0);
+            if (sock < 0) {
+                return;
+            }
+            sockaddr_in address = {};
+            address.sin_family = AF_INET;
+            address.sin_port = htons(CONFIG_RESPEAKER_XVF3800_TUNE_UDP_PORT);
+            address.sin_addr.s_addr = htonl(INADDR_ANY);
+            if (bind(sock, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+                close(sock);
+                return;
+            }
+            tune_socket_ = sock;
+            ESP_LOGW(kTag, "XVF3800 tune: listening on UDP port %d", CONFIG_RESPEAKER_XVF3800_TUNE_UDP_PORT);
+        }
+        char line[64];
+        const int length = recv(tune_socket_, line, sizeof(line) - 1, MSG_DONTWAIT);
+        if (length <= 0) {
+            return;
+        }
+        line[length] = '\0';
+        int duck = 0;
+        if (sscanf(line, "duck %d", &duck) == 1) {
+#if CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK
+            duck_speech_polls_ = std::max(0, std::min(kStrongWindowPolls, duck));
+            ESP_LOGW(kTag, "XVF3800 tune: duck on %d speech polls of %d", duck_speech_polls_, kStrongWindowPolls);
+#endif
+            return;
+        }
+        // "r <resid> <cmd> <f|i|u>[count]" or "w <resid> <cmd> <f|i|u> <v1> [v2] [v3]" (float, int32 or
+        // uint8, up to 3 values: PP_MGSCALE is 3 floats, REBOOT is one uint8); the read-back uses the same count.
+        unsigned resid = 0;
+        unsigned cmd = 0;
+        char type = 0;
+        int count = 1;
+        char text[3][16] = {};
+        const char op = line[0];
+        int fields = 0;
+        if (op == 'r') {
+            fields = sscanf(line + 1, "%u %u %c%d", &resid, &cmd, &type, &count);
+        } else if (op == 'w') {
+            fields = sscanf(line + 1, "%u %u %c %15s %15s %15s", &resid, &cmd, &type, text[0], text[1], text[2]);
+            count = fields - 3;
+        }
+        if ((op != 'r' && op != 'w') || fields < 3 || (op == 'w' && count < 1) || count < 1 || count > 3 ||
+            (type != 'f' && type != 'i' && type != 'u') || resid > 255 || cmd > 127) {
+            line[strcspn(line, "\r\n")] = '\0';
+            ESP_LOGW(kTag, "XVF3800 tune: bad command \"%s\"", line);
+            return;
+        }
+        union {
+            float f[3];
+            int32_t i[3];
+            uint8_t u[12];
+        } value = {};
+        const size_t bytes = static_cast<size_t>(count) * (type == 'u' ? 1U : 4U);
+        if (op == 'w') {
+            for (int k = 0; k < count; ++k) {
+                if (type == 'f') {
+                    value.f[k] = strtof(text[k], nullptr);
+                } else if (type == 'u') {
+                    value.u[k] = static_cast<uint8_t>(strtol(text[k], nullptr, 10));
+                } else {
+                    value.i[k] = static_cast<int32_t>(strtol(text[k], nullptr, 10));
+                }
+            }
+            if (!control_.Write(resid, cmd, &value, bytes)) {
+                return;  // Write() logs the failure
+            }
+        }
+        decltype(value) back = {};
+        const bool ok = control_.Read(resid, cmd, &back, bytes);
+        char shown[64] = {};
+        for (int k = 0, used = 0; k < count && ok && used < static_cast<int>(sizeof(shown)); ++k) {
+            const int value_k = type == 'u' ? back.u[k] : back.i[k];
+            used += type == 'f' ? snprintf(shown + used, sizeof(shown) - used, "%s%g", k ? " " : "",
+                                           static_cast<double>(back.f[k]))
+                                : snprintf(shown + used, sizeof(shown) - used, "%s%d", k ? " " : "", value_k);
+        }
+        ESP_LOGW(kTag, "XVF3800 tune: %u/%u %s %s", resid, cmd, op == 'w' ? "written, now" : "=",
+                 ok ? shown : "(read failed)");
+    }
+
+    int tune_socket_ = -1;
 #endif
 
 #if CONFIG_RESPEAKER_XVF3800_BARGE_IN
@@ -874,6 +1017,8 @@ private:
 #endif
 #if CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK
     bool ducked_ = false;
+    uint64_t duck_history_ = 0;    // one bit per poll over the fast path's window, 1 = speech poll
+    int duck_speech_polls_ = CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK_SPEECH_POLLS;  // 0 = loud polls only
     int burst_polls_ = 0;          // speech polls in the current burst
     int64_t last_speech_us_ = 0;   // time of the burst's latest speech poll
     int64_t duck_since_us_ = 0;
