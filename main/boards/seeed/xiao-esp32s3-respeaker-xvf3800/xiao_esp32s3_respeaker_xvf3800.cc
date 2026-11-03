@@ -42,6 +42,27 @@ constexpr uint32_t kXvf3800I2cSpeedHz = 100000;
 std::atomic<uint32_t> g_input_rms{0};
 // Extra output gain (Q16, 65536 = unity) set by the barge-in monitor while it ducks a reply.
 std::atomic<int32_t> g_output_duck_q16{65536};
+#if CONFIG_RESPEAKER_XVF3800_BARGE_IN
+// The input since the barge-in monitor's previous poll. g_input_rms is one 10 ms chunk,
+// and a poll comes about every 72 ms, so on its own it catches a keystroke or the gap
+// between two syllables by chance.
+struct InputShape {
+    uint32_t chunks = 0;
+    uint32_t samples = 0;
+    uint32_t loud_chunks = 0;  // chunks with an RMS of at least BARGE_IN_MIN_RMS
+    uint32_t max_chunk_rms = 0;
+    uint32_t peak = 0;       // largest |sample|
+    uint32_t crossings = 0;  // sign changes
+    uint64_t square_sum = 0;
+    uint64_t diff_square_sum = 0;  // sum of (x[n] - x[n-1])^2: high frequencies weigh more
+};
+InputShape g_input_shape;
+// The latest input samples, for the monitor's voicing check (16 chunks of 10 ms).
+constexpr int kInputRingSamples = 2560;
+int16_t g_input_ring[kInputRingSamples];
+int g_input_ring_pos = 0;  // where the next sample goes
+portMUX_TYPE g_input_shape_lock = portMUX_INITIALIZER_UNLOCKED;  // guards the shape and the ring
+#endif
 #if CONFIG_RESPEAKER_I2S_EXTERNAL_CLOCK_48K
 constexpr int kAudioSampleRate = 48000;
 constexpr i2s_role_t kI2sRole = I2S_ROLE_SLAVE;
@@ -354,6 +375,15 @@ private:
                             CONFIG_RESPEAKER_XVF3800_CONTROL_POLL_MS));
     static constexpr int kStrongPolls =
         std::max(1, std::min(kStrongWindowPolls, CONFIG_RESPEAKER_XVF3800_BARGE_IN_STRONG_POLLS));
+    // Voicing: XMOS reports speech energy on keystrokes as well, but a vowel repeats at
+    // its pitch period and a keystroke dies away within one or two. Largest r(lag) / r(0)
+    // over 32 ms frames, lags of 2..12.5 ms (500..80 Hz).
+    static constexpr int kVoicedPolls = CONFIG_RESPEAKER_XVF3800_BARGE_IN_VOICED_POLLS;
+    static constexpr int kVoicingFrame = 512;
+    static constexpr int kVoicingHop = 256;
+    static constexpr int kVoicingMinLag = 32;
+    static constexpr int kVoicingMaxLag = 200;
+    static constexpr int kVoicingLeadSamples = 320;  // two chunks before the poll's own
 #endif
 #if CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK
     // Duck instead of interrupting: a backchannel ("en", "dui dui") is as loud as the first
@@ -379,6 +409,11 @@ private:
     static constexpr bool kDiagnostics = true;
 #else
     static constexpr bool kDiagnostics = false;
+#endif
+#if CONFIG_RESPEAKER_XVF3800_BARGE_IN_TRACE
+    static constexpr bool kTrace = true;
+#else
+    static constexpr bool kTrace = false;
 #endif
 
     void Run() {
@@ -406,6 +441,11 @@ private:
                  CONFIG_RESPEAKER_XVF3800_BARGE_IN_INPUT_RMS, kHoldPolls, kWindowPolls,
                  CONFIG_RESPEAKER_XVF3800_CONTROL_POLL_MS, CONFIG_RESPEAKER_XVF3800_BARGE_IN_STRONG_RMS,
                  kStrongPolls, kStrongWindowPolls, CONFIG_RESPEAKER_XVF3800_BARGE_IN_GRACE_MS);
+        const float voicing_threshold = strtof(CONFIG_RESPEAKER_XVF3800_BARGE_IN_VOICING, nullptr);
+        ESP_LOGI(kTag,
+                 "XVF3800 barge-in voicing: interrupt only with %d voiced polls (periodicity >= %g) "
+                 "among the last %d (0 = off)",
+                 kVoicedPolls, static_cast<double>(voicing_threshold), kWindowPolls);
 #endif
 #if CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK
         ESP_LOGI(kTag,
@@ -427,6 +467,23 @@ private:
             vTaskDelay(pdMS_TO_TICKS(CONFIG_RESPEAKER_XVF3800_CONTROL_POLL_MS));
             const int64_t now = esp_timer_get_time();
             const bool speaking = app.GetDeviceState() == kDeviceStateSpeaking;
+#if CONFIG_RESPEAKER_XVF3800_BARGE_IN
+            portENTER_CRITICAL(&g_input_shape_lock);
+            const InputShape shape = g_input_shape;
+            g_input_shape = InputShape{};
+            recent_count_ = 0;
+            if (speaking) {
+                // The samples since the previous poll and two chunks before them, oldest first.
+                recent_count_ = static_cast<int>(
+                    std::min<uint32_t>(shape.samples + kVoicingLeadSamples, kInputRingSamples));
+                int start = g_input_ring_pos - recent_count_;
+                start += start < 0 ? kInputRingSamples : 0;
+                const int first = std::min(recent_count_, kInputRingSamples - start);
+                memcpy(recent_, g_input_ring + start, first * sizeof(int16_t));
+                memcpy(recent_ + first, g_input_ring, (recent_count_ - first) * sizeof(int16_t));
+            }
+            portEXIT_CRITICAL(&g_input_shape_lock);
+#endif
             if (!speaking) {
 #if CONFIG_RESPEAKER_XVF3800_ECHO_GUARD
                 if (speaking_since_us_ != 0) {
@@ -436,6 +493,7 @@ private:
                 speaking_since_us_ = 0;
                 history_ = 0;
                 strong_history_ = 0;
+                voiced_history_ = 0;
 #if CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK
                 // GPT-Live's replies arrive as segments split at 0.7 s of silence, so a segment
                 // can end in the middle of a ducked burst; the burst then carries over a short gap
@@ -452,6 +510,7 @@ private:
                 speaking_since_us_ = now;
                 history_ = 0;
                 strong_history_ = 0;
+                voiced_history_ = 0;
             }
             const bool report =
                 kDiagnostics && now - last_report_us_ >= (speaking ? 200000 : 500000);
@@ -475,6 +534,8 @@ private:
             }
 #endif
 #if CONFIG_RESPEAKER_XVF3800_BARGE_IN
+            [[maybe_unused]] float voicing = -1.0f;  // not computed
+            [[maybe_unused]] int voicing_us = 0;
 #if CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK
             // A burst carried over from the previous segment is still being spoken: no grace.
             const bool counting = now - speaking_since_us_ >= kGraceUs ||
@@ -497,16 +558,29 @@ private:
                     CONFIG_RESPEAKER_XVF3800_BARGE_IN_STRONG_RMS > 0 &&
                     input_rms > static_cast<uint32_t>(CONFIG_RESPEAKER_XVF3800_BARGE_IN_STRONG_RMS) &&
                     peak > threshold;
+                // Typing next to the board also carries speech energy (11-03: polls of
+                // 2000..20000 RMS that filled the window), so an interruption also needs
+                // voiced polls among the window's speech polls.
+                if (speech && (kVoicedPolls > 0 || kTrace)) {
+                    const int64_t started = esp_timer_get_time();
+                    voicing = Voicing();
+                    voicing_us = static_cast<int>(esp_timer_get_time() - started);
+                }
+                const bool voiced = speech && voicing >= voicing_threshold;
                 history_ = (history_ << 1) | (speech ? 1ULL : 0ULL);
                 strong_history_ = (strong_history_ << 1) | (strong ? 1ULL : 0ULL);
+                voiced_history_ = (voiced_history_ << 1) | (voiced ? 1ULL : 0ULL);
                 if (kWindowPolls < 64) {
                     history_ &= (1ULL << kWindowPolls) - 1;
+                    voiced_history_ &= (1ULL << kWindowPolls) - 1;
                 }
                 if (kStrongWindowPolls < 64) {
                     strong_history_ &= (1ULL << kStrongWindowPolls) - 1;
                 }
                 const bool fast = __builtin_popcountll(strong_history_) >= kStrongPolls;
                 const bool window = __builtin_popcountll(history_) >= kHoldPolls;
+                const int voiced_polls = __builtin_popcountll(voiced_history_);
+                const bool voiced_enough = kVoicedPolls == 0 || voiced_polls >= kVoicedPolls;
 #if CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK
                 // A burst is a run of speech polls with gaps shorter than the release time.
                 if (speech) {
@@ -528,11 +602,19 @@ private:
                 }
                 const bool confirmed =
                     ducked_ && kDuckConfirmPolls > 0 && burst_polls_ >= kDuckConfirmPolls;
-                if (window || confirmed) {
-                    armed_ = false;
+                if ((window || confirmed) && voiced_enough) {
                     history_ = 0;
                     strong_history_ = 0;
-                    BargeIn(energy, input_rms, window ? "speech window" : "ducked burst");
+                    voiced_history_ = 0;
+                    BargeIn(energy, voiced_polls, input_rms, window ? "speech window" : "ducked burst");
+#if CONFIG_RESPEAKER_XVF3800_BARGE_IN_LOG_ONLY
+                    // The reply goes on: count the next burst from scratch, at full volume.
+                    burst_polls_ = 0;
+                    last_speech_us_ = 0;
+                    SetDucked(false);
+#else
+                    armed_ = false;
+#endif
                 } else if (ducked_ && now - last_speech_us_ >= kDuckReleaseUs) {
                     SetDucked(false);
                     ESP_LOGI(kTag,
@@ -541,11 +623,14 @@ private:
                              burst_polls_, static_cast<long long>((now - duck_since_us_) / 1000));
                 }
 #else
-                if (fast || window) {
+                if ((fast || window) && voiced_enough) {
+#if !CONFIG_RESPEAKER_XVF3800_BARGE_IN_LOG_ONLY
                     armed_ = false;
+#endif
                     history_ = 0;
                     strong_history_ = 0;
-                    BargeIn(energy, input_rms, fast ? "loud polls" : "speech window");
+                    voiced_history_ = 0;
+                    BargeIn(energy, voiced_polls, input_rms, fast ? "loud polls" : "speech window");
                 }
 #endif
             }
@@ -557,9 +642,24 @@ private:
 #else
                 const char* duck_tag = "";
 #endif
-                ESP_LOGI(kTag, "XVF3800 poll +%lld rms=%u peak=%.3g%s",
+                // rms / peak: the latest chunk and the largest speech energy, as voted on.
+                // The rest covers every chunk since the previous poll: count, RMS, loudest
+                // chunk, chunks of at least MIN_RMS, largest |sample|, high-frequency weight
+                // (difference energy over energy, percent), sign changes per 1000 samples and,
+                // on speech polls, the voicing in percent (-1 = not computed) and its CPU time.
+                const uint64_t samples = std::max<uint32_t>(shape.samples, 1);
+                ESP_LOGI(kTag,
+                         "XVF3800 poll +%lld rms=%u peak=%.3g n=%u avg=%u max=%u loud=%u pk=%u hf=%u zc=%u voi=%d "
+                         "vus=%d%s",
                          static_cast<long long>((now - speaking_since_us_) / 1000),
-                         static_cast<unsigned>(input_rms), static_cast<double>(peak), duck_tag);
+                         static_cast<unsigned>(input_rms), static_cast<double>(peak),
+                         static_cast<unsigned>(shape.chunks),
+                         static_cast<unsigned>(std::sqrt(static_cast<double>(shape.square_sum) / samples)),
+                         static_cast<unsigned>(shape.max_chunk_rms), static_cast<unsigned>(shape.loud_chunks),
+                         static_cast<unsigned>(shape.peak),
+                         static_cast<unsigned>(shape.square_sum == 0 ? 0 : shape.diff_square_sum * 100 / shape.square_sum),
+                         static_cast<unsigned>(shape.crossings * 1000ULL / samples),
+                         voicing < 0.0f ? -1 : static_cast<int>(voicing * 100.0f), voicing_us, duck_tag);
             }
 #endif
             if (report) {
@@ -645,12 +745,60 @@ private:
 #endif
 
 #if CONFIG_RESPEAKER_XVF3800_BARGE_IN
-    void BargeIn(const float* energy, uint32_t input_rms, const char* path) {
+    // Largest r(lag) / r(0) over recent_, in 512-sample frames stepping back from the newest
+    // sample by kVoicingHop, for lags of kVoicingMinLag..kVoicingMaxLag. Each lag sums over
+    // the frame's overlap with itself, so a sound that dies away within the lag scores low.
+    float Voicing() {
+        float best = 0.0f;
+        for (int start = recent_count_ - kVoicingFrame; start >= 0; start -= kVoicingHop) {
+            float mean = 0.0f;
+            for (int i = 0; i < kVoicingFrame; ++i) {
+                mean += recent_[start + i];
+            }
+            mean /= kVoicingFrame;
+            float r0 = 0.0f;
+            for (int i = 0; i < kVoicingFrame; ++i) {
+                frame_[i] = recent_[start + i] - mean;
+                r0 += frame_[i] * frame_[i];
+            }
+            if (r0 <= 0.0f) {
+                continue;
+            }
+            for (int lag = kVoicingMinLag; lag <= kVoicingMaxLag; ++lag) {
+                // Four partial sums: the size-optimised build does not unroll this loop, and
+                // one accumulator waits on the FPU latency at every step.
+                const float* head = frame_;
+                const float* tail = frame_ + lag;
+                const int count = kVoicingFrame - lag;
+                float sum[4] = {};
+                int i = 0;
+                for (; i + 4 <= count; i += 4) {
+                    sum[0] += head[i] * tail[i];
+                    sum[1] += head[i + 1] * tail[i + 1];
+                    sum[2] += head[i + 2] * tail[i + 2];
+                    sum[3] += head[i + 3] * tail[i + 3];
+                }
+                float r = (sum[0] + sum[1]) + (sum[2] + sum[3]);
+                for (; i < count; ++i) {
+                    r += head[i] * tail[i];
+                }
+                best = std::max(best, r / r0);
+            }
+        }
+        return best;
+    }
+
+    void BargeIn(const float* energy, int voiced_polls, uint32_t input_rms, const char* path) {
         ESP_LOGI(kTag,
-                 "XVF3800 near-end speech during playback (spenergy %.3g/%.3g/%.3g/%.3g, input rms %u, %s); aborting",
+                 "XVF3800 near-end speech during playback (spenergy %.3g/%.3g/%.3g/%.3g, %d voiced polls, "
+                 "input rms %u, %s); aborting",
                  static_cast<double>(energy[0]), static_cast<double>(energy[1]),
-                 static_cast<double>(energy[2]), static_cast<double>(energy[3]),
+                 static_cast<double>(energy[2]), static_cast<double>(energy[3]), voiced_polls,
                  static_cast<unsigned>(input_rms), path);
+#if CONFIG_RESPEAKER_XVF3800_BARGE_IN_LOG_ONLY
+        ESP_LOGI(kTag, "XVF3800 barge-in log only: the reply keeps playing");
+        return;
+#endif
         // Same steps as the server's "tts stop" plus the wake-word path's queue flush,
         // executed in the main task: tell the server, drop queued audio, start listening.
         Application::GetInstance().Schedule([]() {
@@ -718,6 +866,12 @@ private:
     int64_t speaking_since_us_ = 0;
     uint64_t history_ = 0;  // one bit per poll, 1 = speech energy above threshold
     uint64_t strong_history_ = 0;  // one bit per poll, 1 = input rms above STRONG_RMS
+    uint64_t voiced_history_ = 0;  // one bit per poll, 1 = a voiced speech poll
+#if CONFIG_RESPEAKER_XVF3800_BARGE_IN
+    int16_t recent_[kInputRingSamples];  // the input since the previous poll, see Run()
+    int recent_count_ = 0;
+    float frame_[kVoicingFrame];
+#endif
 #if CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK
     bool ducked_ = false;
     int burst_polls_ = 0;          // speech polls in the current burst
@@ -744,6 +898,9 @@ private:
         std::vector<int32_t> tx_buffer_;
         int32_t duck_applied_q16_ = 65536;  // g_output_duck_q16 as of the end of the last write
         int64_t last_rx_error_us_ = -5000000;
+#if CONFIG_RESPEAKER_XVF3800_BARGE_IN
+        int32_t previous_sample_ = 0;  // last input sample of the previous read, for InputShape
+#endif
 #if CONFIG_RESPEAKER_AUDIO_DIAGNOSTICS
         int64_t last_rx_report_us_ = 0;
         uint32_t rx_frames_ = 0;
@@ -885,11 +1042,24 @@ private:
 
             const size_t frames = bytes_read / (2 * sizeof(int32_t));
             uint64_t square_sum = 0;
+#if CONFIG_RESPEAKER_XVF3800_BARGE_IN
+            uint64_t diff_square_sum = 0;
+            uint32_t peak = 0;
+            uint32_t crossings = 0;
+            int32_t previous = previous_sample_;
+#endif
             for (size_t i = 0; i < frames; ++i) {
                 const int32_t left = rx_buffer_[i * 2];
                 const int32_t value = left >> 16;
                 dest[i] = static_cast<int16_t>(value);
                 square_sum += static_cast<uint64_t>(static_cast<int64_t>(value) * value);
+#if CONFIG_RESPEAKER_XVF3800_BARGE_IN
+                const int32_t diff = value - previous;
+                diff_square_sum += static_cast<uint64_t>(static_cast<int64_t>(diff) * diff);
+                peak = std::max(peak, static_cast<uint32_t>(value < 0 ? -value : value));
+                crossings += (value < 0) != (previous < 0);
+                previous = value;
+#endif
 #if CONFIG_RESPEAKER_AUDIO_DIAGNOSTICS
                 const int32_t right = rx_buffer_[i * 2 + 1];
                 const uint32_t left_peak =
@@ -905,8 +1075,29 @@ private:
 #endif
             }
             if (frames > 0) {
-                g_input_rms.store(static_cast<uint32_t>(std::sqrt(static_cast<double>(square_sum) / frames)),
-                                  std::memory_order_relaxed);
+                const uint32_t rms = static_cast<uint32_t>(std::sqrt(static_cast<double>(square_sum) / frames));
+                g_input_rms.store(rms, std::memory_order_relaxed);
+#if CONFIG_RESPEAKER_XVF3800_BARGE_IN
+                previous_sample_ = previous;
+                portENTER_CRITICAL(&g_input_shape_lock);
+                InputShape& shape = g_input_shape;
+                ++shape.chunks;
+                shape.samples += static_cast<uint32_t>(frames);
+                shape.loud_chunks += rms >= static_cast<uint32_t>(CONFIG_RESPEAKER_XVF3800_BARGE_IN_MIN_RMS);
+                shape.max_chunk_rms = std::max(shape.max_chunk_rms, rms);
+                shape.peak = std::max(shape.peak, peak);
+                shape.crossings += crossings;
+                shape.square_sum += square_sum;
+                shape.diff_square_sum += diff_square_sum;
+                for (size_t done = 0; done < frames;) {
+                    const size_t count =
+                        std::min(frames - done, static_cast<size_t>(kInputRingSamples - g_input_ring_pos));
+                    memcpy(g_input_ring + g_input_ring_pos, dest + done, count * sizeof(int16_t));
+                    g_input_ring_pos = (g_input_ring_pos + static_cast<int>(count)) % kInputRingSamples;
+                    done += count;
+                }
+                portEXIT_CRITICAL(&g_input_shape_lock);
+#endif
             }
 #if CONFIG_RESPEAKER_AUDIO_DIAGNOSTICS
             rx_frames_ += static_cast<uint32_t>(frames);

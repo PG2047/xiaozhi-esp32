@@ -835,6 +835,60 @@ config RESPEAKER_XVF3800_BARGE_IN_TRACE
         processed-input RMS and the largest speech energy, so that a recorded
         test session can be replayed offline against other vote rules. About
         20 lines per second during playback; keep it off in normal builds.
+        The line also describes every input chunk since the previous poll
+        (polls see one 10 ms chunk in about seven): their number, RMS, the
+        loudest chunk, chunks of at least RESPEAKER_XVF3800_BARGE_IN_MIN_RMS,
+        the largest sample, the difference energy over the energy (percent;
+        mostly single digits for speech, 200 for white noise), sign changes
+        per 1000 samples and, on speech polls, the voicing of
+        RESPEAKER_XVF3800_BARGE_IN_VOICING (percent) and the microseconds it
+        took.
+
+config RESPEAKER_XVF3800_BARGE_IN_VOICED_POLLS
+    int "ReSpeaker: voiced polls an interruption needs in the speech window (0 = off)"
+    depends on RESPEAKER_XVF3800_BARGE_IN
+    range 0 64
+    default 0
+    help
+        The XVF3800 reports speech energy on keystrokes as well: on 11-03,
+        typing next to a reSpeaker XVF3800 filled the speech window during
+        playback and interrupted replies while nobody spoke, at least four
+        times in five minutes, at input levels as high as a spoken command's.
+        Each speech poll also
+        measures how periodic its input is (RESPEAKER_XVF3800_BARGE_IN_VOICING),
+        and both the speech window and a ducked burst interrupt the reply only
+        once this many of the polls in the speech window are voiced; the fast
+        path still ducks without it. This buys margin, not a clean split: that
+        keyboard rings at about 170 Hz for up to 100 ms after a keystroke,
+        which scored 0.27..0.79 against 0.37..0.91 for a stop phrase spoken
+        during playback (the XMOS double-talk processing chops near-end
+        speech). Replaying recordings with 2 polls at 0.75, 22 s of that
+        typing no longer interrupted the reply (4 times with this option off)
+        and the stop phrase still interrupted at the same poll. Tune both
+        values again for another keyboard or room.
+
+config RESPEAKER_XVF3800_BARGE_IN_VOICING
+    string "ReSpeaker: periodicity that makes a speech poll voiced"
+    depends on RESPEAKER_XVF3800_BARGE_IN
+    default "0.75"
+    help
+        Largest r(lag) / r(0) over the input since the previous poll and the
+        20 ms before it, in 32 ms frames stepping back from the newest sample
+        by 16 ms, for lags of 2..12.5 ms (pitch 80..500 Hz); r(lag) sums over
+        the frame's overlap with itself, so a sound that dies away within the
+        lag scores low. Computed on speech polls only: on the reSpeaker
+        XVF3800 (size-optimised build) about 5 ms per speech poll, at most
+        9 ms, and the poll interval during playback stayed at about 70 ms.
+
+config RESPEAKER_XVF3800_BARGE_IN_LOG_ONLY
+    bool "ReSpeaker: log barge-in decisions without interrupting (evaluation only)"
+    depends on RESPEAKER_XVF3800_BARGE_IN
+    default n
+    help
+        When the votes add up, the decision is logged, the count starts again
+        and the reply keeps playing (the fast path still ducks it). Used to
+        record a long stretch of a noise source next to the board during
+        playback, for example typing, and replay it offline.
 
 config RESPEAKER_XVF3800_ECHO_GUARD
     bool "ReSpeaker: reboot the XMOS when replies keep starting with near-full-scale echo"
