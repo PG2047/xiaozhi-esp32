@@ -771,6 +771,61 @@ config RESPEAKER_XVF3800_BARGE_IN_STRONG_WINDOW_MS
         barge-in, so a window of a few polls keeps the fast path for speech
         while isolated knocks no longer add up.
 
+config RESPEAKER_XVF3800_BARGE_IN_DUCK
+    bool "ReSpeaker: the fast path lowers the volume instead of interrupting"
+    depends on RESPEAKER_XVF3800_BARGE_IN
+    default n
+    help
+        Loudness does not tell an interruption from a backchannel. On a
+        reSpeaker XVF3800 a listener's one-syllable "en" (3811 and 4313 RMS on
+        consecutive polls) and a synthetic "dui dui" (2847, 2651) looked like
+        the start of a synthetic "xiao zhi, stop" (2302..7244), and the
+        backchannels were over after about 430 ms while the first word of the
+        command lasted 430..580 ms before a pause. With this option the fast
+        path only ducks the playback to RESPEAKER_XVF3800_BARGE_IN_DUCK_PERCENT;
+        the reply is interrupted once the speech window fills or the ducked
+        burst adds up RESPEAKER_XVF3800_BARGE_IN_DUCK_CONFIRM_POLLS speech
+        polls, and the volume comes back when the burst ends first.
+
+config RESPEAKER_XVF3800_BARGE_IN_DUCK_PERCENT
+    int "ReSpeaker: playback amplitude while ducked (percent of normal)"
+    depends on RESPEAKER_XVF3800_BARGE_IN_DUCK
+    range 0 100
+    default 25
+    help
+        Applied to the samples sent to the XVF3800, which plays them and also
+        uses them as its echo reference, so the echo canceller only sees a gain
+        change. The change is ramped over one DMA chunk (15 ms at 16 kHz) and
+        reaches the loudspeaker behind the queued DMA audio (90 ms) and the
+        frame being written (up to 60 ms).
+
+config RESPEAKER_XVF3800_BARGE_IN_DUCK_CONFIRM_POLLS
+    int "ReSpeaker: speech polls in a ducked burst that interrupt the reply (0 = speech window only)"
+    depends on RESPEAKER_XVF3800_BARGE_IN_DUCK
+    range 0 64
+    default 8
+    help
+        Counted from the first speech poll of the burst, so the polls before
+        the duck count too, and across gaps shorter than
+        RESPEAKER_XVF3800_BARGE_IN_DUCK_RELEASE_MS, so the pause after the
+        first word of a command does not start the count again.
+
+config RESPEAKER_XVF3800_BARGE_IN_DUCK_RELEASE_MS
+    int "ReSpeaker: a ducked burst ends after this long without a speech poll (ms)"
+    depends on RESPEAKER_XVF3800_BARGE_IN_DUCK
+    range 100 2000
+    default 400
+    help
+        Measured in real time, not in polls. Longer than the pause after
+        "xiao zhi," in a synthetic stop phrase (about 290 ms), so the command
+        stays one burst; when a burst ends without interrupting, the volume
+        ramps back. A reply segment that ends within this time of the last
+        speech poll does not end the burst: the next segment is counted
+        without RESPEAKER_XVF3800_BARGE_IN_GRACE_MS (a stop phrase that began
+        in the gap between two GPT-Live segments lost four loud polls to the
+        grace period and was cut 1.3 s after its onset) and starts ducked if
+        the burst was ducked.
+
 config RESPEAKER_XVF3800_BARGE_IN_TRACE
     bool "ReSpeaker: log every barge-in poll while speaking (evaluation only)"
     depends on RESPEAKER_XVF3800_BARGE_IN

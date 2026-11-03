@@ -40,6 +40,8 @@ constexpr uint32_t kXvf3800I2cSpeedHz = 100000;
 
 // RMS (16-bit units) of the most recent I2S input chunk, for the barge-in monitor.
 std::atomic<uint32_t> g_input_rms{0};
+// Extra output gain (Q16, 65536 = unity) set by the barge-in monitor while it ducks a reply.
+std::atomic<int32_t> g_output_duck_q16{65536};
 #if CONFIG_RESPEAKER_I2S_EXTERNAL_CLOCK_48K
 constexpr int kAudioSampleRate = 48000;
 constexpr i2s_role_t kI2sRole = I2S_ROLE_SLAVE;
@@ -353,6 +355,14 @@ private:
     static constexpr int kStrongPolls =
         std::max(1, std::min(kStrongWindowPolls, CONFIG_RESPEAKER_XVF3800_BARGE_IN_STRONG_POLLS));
 #endif
+#if CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK
+    // Duck instead of interrupting: a backchannel ("en", "dui dui") is as loud as the first
+    // word of a command and only shorter, so the fast path lowers the volume and the reply is
+    // interrupted once the burst outlasts a backchannel.
+    static constexpr int32_t kDuckQ16 = CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK_PERCENT * 65536 / 100;
+    static constexpr int kDuckConfirmPolls = CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK_CONFIRM_POLLS;
+    static constexpr int64_t kDuckReleaseUs = CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK_RELEASE_MS * 1000LL;
+#endif
 #if CONFIG_RESPEAKER_XVF3800_ECHO_GUARD
     // Echo guard. A reply that carries near-full-scale input on two polls within its
     // first 800 ms is the device hearing itself: on 11-02 one overload during playback
@@ -397,6 +407,13 @@ private:
                  CONFIG_RESPEAKER_XVF3800_CONTROL_POLL_MS, CONFIG_RESPEAKER_XVF3800_BARGE_IN_STRONG_RMS,
                  kStrongPolls, kStrongWindowPolls, CONFIG_RESPEAKER_XVF3800_BARGE_IN_GRACE_MS);
 #endif
+#if CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK
+        ESP_LOGI(kTag,
+                 "XVF3800 barge-in duck: the fast path ducks the reply to %d%%; interrupt after %d speech "
+                 "polls in the ducked burst (0 = speech window only), volume back after %d ms without speech",
+                 CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK_PERCENT, kDuckConfirmPolls,
+                 CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK_RELEASE_MS);
+#endif
 #if CONFIG_RESPEAKER_XVF3800_ECHO_GUARD
         ESP_LOGI(kTag,
                  "XVF3800 echo guard: reboot the XMOS after %d replies in a row with input rms > %d "
@@ -419,6 +436,17 @@ private:
                 speaking_since_us_ = 0;
                 history_ = 0;
                 strong_history_ = 0;
+#if CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK
+                // GPT-Live's replies arrive as segments split at 0.7 s of silence, so a segment
+                // can end in the middle of a ducked burst; the burst then carries over a short gap
+                // and the next segment starts ducked. After an interruption, or once the burst
+                // is over, the next reply starts at full volume.
+                if (!armed_ || now - last_speech_us_ >= kDuckReleaseUs) {
+                    SetDucked(false);
+                    burst_polls_ = 0;
+                    last_speech_us_ = 0;
+                }
+#endif
                 armed_ = true;
             } else if (speaking_since_us_ == 0) {
                 speaking_since_us_ = now;
@@ -447,7 +475,14 @@ private:
             }
 #endif
 #if CONFIG_RESPEAKER_XVF3800_BARGE_IN
-            if (speaking && armed_ && now - speaking_since_us_ >= kGraceUs) {
+#if CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK
+            // A burst carried over from the previous segment is still being spoken: no grace.
+            const bool counting = now - speaking_since_us_ >= kGraceUs ||
+                                  (last_speech_us_ != 0 && now - last_speech_us_ < kDuckReleaseUs);
+#else
+            const bool counting = now - speaking_since_us_ >= kGraceUs;
+#endif
+            if (speaking && armed_ && counting) {
                 const bool energy_vote =
                     peak > threshold &&
                     input_rms >= static_cast<uint32_t>(CONFIG_RESPEAKER_XVF3800_BARGE_IN_MIN_RMS);
@@ -471,19 +506,60 @@ private:
                     strong_history_ &= (1ULL << kStrongWindowPolls) - 1;
                 }
                 const bool fast = __builtin_popcountll(strong_history_) >= kStrongPolls;
-                if (fast || __builtin_popcountll(history_) >= kHoldPolls) {
+                const bool window = __builtin_popcountll(history_) >= kHoldPolls;
+#if CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK
+                // A burst is a run of speech polls with gaps shorter than the release time.
+                if (speech) {
+                    if (now - last_speech_us_ >= kDuckReleaseUs) {
+                        burst_polls_ = 0;
+                    }
+                    ++burst_polls_;
+                    last_speech_us_ = now;
+                }
+                if (fast && !ducked_) {
+                    strong_history_ = 0;  // a second loud burst ducks again, it does not escalate
+                    duck_since_us_ = now;
+                    SetDucked(true);
+                    ESP_LOGI(kTag,
+                             "XVF3800 loud near-end during playback (input rms %u, speech poll %d of the "
+                             "burst); ducking to %d%%",
+                             static_cast<unsigned>(input_rms), burst_polls_,
+                             CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK_PERCENT);
+                }
+                const bool confirmed =
+                    ducked_ && kDuckConfirmPolls > 0 && burst_polls_ >= kDuckConfirmPolls;
+                if (window || confirmed) {
                     armed_ = false;
                     history_ = 0;
                     strong_history_ = 0;
-                    BargeIn(energy, input_rms, fast);
+                    BargeIn(energy, input_rms, window ? "speech window" : "ducked burst");
+                } else if (ducked_ && now - last_speech_us_ >= kDuckReleaseUs) {
+                    SetDucked(false);
+                    ESP_LOGI(kTag,
+                             "XVF3800 near-end burst ended after %d speech polls; volume back after "
+                             "%lld ms ducked",
+                             burst_polls_, static_cast<long long>((now - duck_since_us_) / 1000));
                 }
+#else
+                if (fast || window) {
+                    armed_ = false;
+                    history_ = 0;
+                    strong_history_ = 0;
+                    BargeIn(energy, input_rms, fast ? "loud polls" : "speech window");
+                }
+#endif
             }
 #endif
 #if CONFIG_RESPEAKER_XVF3800_BARGE_IN_TRACE
             if (speaking) {
-                ESP_LOGI(kTag, "XVF3800 poll +%lld rms=%u peak=%.3g",
+#if CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK
+                const char* duck_tag = ducked_ ? " duck" : "";
+#else
+                const char* duck_tag = "";
+#endif
+                ESP_LOGI(kTag, "XVF3800 poll +%lld rms=%u peak=%.3g%s",
                          static_cast<long long>((now - speaking_since_us_) / 1000),
-                         static_cast<unsigned>(input_rms), static_cast<double>(peak));
+                         static_cast<unsigned>(input_rms), static_cast<double>(peak), duck_tag);
             }
 #endif
             if (report) {
@@ -561,13 +637,20 @@ private:
                  static_cast<int>(converged), static_cast<int>(path_change));
     }
 
+#if CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK
+    void SetDucked(bool ducked) {
+        ducked_ = ducked;
+        g_output_duck_q16.store(ducked ? kDuckQ16 : 65536, std::memory_order_relaxed);
+    }
+#endif
+
 #if CONFIG_RESPEAKER_XVF3800_BARGE_IN
-    void BargeIn(const float* energy, uint32_t input_rms, bool fast) {
+    void BargeIn(const float* energy, uint32_t input_rms, const char* path) {
         ESP_LOGI(kTag,
                  "XVF3800 near-end speech during playback (spenergy %.3g/%.3g/%.3g/%.3g, input rms %u, %s); aborting",
                  static_cast<double>(energy[0]), static_cast<double>(energy[1]),
                  static_cast<double>(energy[2]), static_cast<double>(energy[3]),
-                 static_cast<unsigned>(input_rms), fast ? "loud polls" : "speech window");
+                 static_cast<unsigned>(input_rms), path);
         // Same steps as the server's "tts stop" plus the wake-word path's queue flush,
         // executed in the main task: tell the server, drop queued audio, start listening.
         Application::GetInstance().Schedule([]() {
@@ -635,6 +718,12 @@ private:
     int64_t speaking_since_us_ = 0;
     uint64_t history_ = 0;  // one bit per poll, 1 = speech energy above threshold
     uint64_t strong_history_ = 0;  // one bit per poll, 1 = input rms above STRONG_RMS
+#if CONFIG_RESPEAKER_XVF3800_BARGE_IN_DUCK
+    bool ducked_ = false;
+    int burst_polls_ = 0;          // speech polls in the current burst
+    int64_t last_speech_us_ = 0;   // time of the burst's latest speech poll
+    int64_t duck_since_us_ = 0;
+#endif
 #if CONFIG_RESPEAKER_XVF3800_ECHO_GUARD
     int reply_loud_polls_ = 0;  // polls above ECHO_GUARD_RMS in the current reply's start
     int echo_replies_ = 0;      // consecutive replies that started that loud
@@ -653,6 +742,7 @@ private:
     private:
         std::vector<int32_t> rx_buffer_;
         std::vector<int32_t> tx_buffer_;
+        int32_t duck_applied_q16_ = 65536;  // g_output_duck_q16 as of the end of the last write
         int64_t last_rx_error_us_ = -5000000;
 #if CONFIG_RESPEAKER_AUDIO_DIAGNOSTICS
         int64_t last_rx_report_us_ = 0;
@@ -830,14 +920,22 @@ private:
             tx_buffer_.resize(static_cast<size_t>(samples) * 2);
             const double volume_ratio = static_cast<double>(output_volume_) / 100.0;
             const int32_t volume_factor = static_cast<int32_t>(volume_ratio * volume_ratio * 65536);
+            // The XVF3800 plays these samples and uses them as its echo reference, so a duck from
+            // the barge-in monitor is ramped over one DMA chunk instead of stepped.
+            const int32_t duck = g_output_duck_q16.load(std::memory_order_relaxed);
+            const int ramp = duck == duck_applied_q16_ ? 0 : std::min(samples, AUDIO_CODEC_DMA_FRAME_NUM);
 
             for (int i = 0; i < samples; ++i) {
-                const int64_t scaled = static_cast<int64_t>(data[i]) * volume_factor;
+                const int64_t gain =
+                    i < ramp ? duck_applied_q16_ + static_cast<int64_t>(duck - duck_applied_q16_) * (i + 1) / ramp
+                             : duck;
+                const int64_t scaled = static_cast<int64_t>(data[i]) * volume_factor * gain / 65536;
                 const int32_t sample =
                     static_cast<int32_t>(std::clamp<int64_t>(scaled, INT32_MIN, INT32_MAX));
                 tx_buffer_[static_cast<size_t>(i) * 2] = sample;
                 tx_buffer_[static_cast<size_t>(i) * 2 + 1] = sample;
             }
+            duck_applied_q16_ = duck;
 
             constexpr size_t kFrameBytes = 2 * sizeof(int32_t);
             constexpr size_t kChunkBytes = AUDIO_CODEC_DMA_FRAME_NUM * kFrameBytes;
