@@ -859,10 +859,11 @@ config RESPEAKER_XVF3800_BARGE_IN_DUCK_RELEASE_MS
         speech poll of "xiao zhi" and the first of "stop" were 420..480 ms
         apart while a story played, so with 400 the count started again and
         the reply was interrupted about 1.5 s after the onset. The reSpeaker
-        XVF3800 config.json uses 500: replaying four recorded sessions, 500
-        caught the same stop phrases as 600 with one false interruption fewer
-        (a longer gap also merges stray echo votes into one burst), while 400
-        missed one per session. A reply segment that ends within this time of the last
+        XVF3800 config.json uses 500: replaying the 11-03 recordings through
+        this logic, 500 caught the same stop phrases as 600 with one false
+        interruption fewer (a longer gap also merges stray echo votes into one
+        burst), while 400 caught one stop phrase per test run late or not at
+        all. A reply segment that ends within this time of the last
         speech poll does not end the burst: the next segment is counted
         without RESPEAKER_XVF3800_BARGE_IN_GRACE_MS (a stop phrase that began
         in the gap between two GPT-Live segments lost four loud polls to the
