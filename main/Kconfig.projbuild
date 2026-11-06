@@ -976,6 +976,48 @@ config RESPEAKER_XVF3800_TUNE_UDP_PORT
         the network can change the DSP, so keep it at 0 outside test builds.
         Written XMOS values stay until the XMOS is power-cycled or rebooted.
 
+config RESPEAKER_XVF3800_AEC_WATCH
+    bool "ReSpeaker: watch the XVF3800 echo canceller on the right channel and reboot it when broken"
+    depends on RESPEAKER_XVF3800_BARGE_IN
+    default n
+    help
+        The right channel carries the signal after the echo canceller and before the
+        post-processing. When the canceller stops working the post-processing suppresses
+        the echo and the talker with it: the left channel stays quiet, a talker can no longer
+        interrupt, and the echo guard (which watches the left channel) sees nothing. This option
+        compares the right channel with what is sent to the XMOS during playback and, when the
+        median stays high, reboots the XMOS once the device is quiet, checks the next playback,
+        and after MAX_REBOOTS reboots tells the server that a power cycle is needed.
+
+config RESPEAKER_XVF3800_AEC_WATCH_RATIO
+    string "ReSpeaker: median right / playback that counts as a broken echo canceller"
+    depends on RESPEAKER_XVF3800_AEC_WATCH
+    default "1.0"
+    help
+        Healthy XVF3800: 0.09..0.16 over a minute of playback, 0.35 while knocking next to the
+        board. The broken state of 11-04 was never measured with this ratio; its old logs suggest
+        about 3.
+
+config RESPEAKER_XVF3800_AEC_WATCH_WINDOWS
+    int "ReSpeaker: seconds of playback in the echo canceller median"
+    depends on RESPEAKER_XVF3800_AEC_WATCH
+    range 2 120
+    default 60
+
+config RESPEAKER_XVF3800_AEC_WATCH_VERIFY_S
+    int "ReSpeaker: seconds of playback after which a reboot of the XMOS counts as failed"
+    depends on RESPEAKER_XVF3800_AEC_WATCH
+    range 2 3600
+    default 120
+    help
+        After a power cycle the canceller converged within 36 s of playback.
+
+config RESPEAKER_XVF3800_AEC_WATCH_MAX_REBOOTS
+    int "ReSpeaker: reboots of the XMOS in 24 hours before asking for a power cycle (0 = only report)"
+    depends on RESPEAKER_XVF3800_AEC_WATCH
+    range 0 8
+    default 3
+
 config RESPEAKER_XVF3800_ECHO_GUARD
     bool "ReSpeaker: reboot the XMOS when replies keep starting with near-full-scale echo"
     depends on RESPEAKER_XVF3800_BARGE_IN

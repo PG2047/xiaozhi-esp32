@@ -23,6 +23,10 @@
 #include <cstring>
 #include <vector>
 
+#if CONFIG_RESPEAKER_XVF3800_AEC_WATCH
+#include "aec_watch.h"
+#endif
+
 #if CONFIG_RESPEAKER_XVF3800_TUNE_UDP_PORT
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -69,6 +73,18 @@ constexpr int kInputRingSamples = 2560;
 int16_t g_input_ring[kInputRingSamples];
 int g_input_ring_pos = 0;  // where the next sample goes
 portMUX_TYPE g_input_shape_lock = portMUX_INITIALIZER_UNLOCKED;  // guards the shape and the ring
+#endif
+#if CONFIG_RESPEAKER_XVF3800_AEC_WATCH
+// What arrived on both channels and what went to the XMOS since the monitor last looked (about a
+// second), guarded by g_input_shape_lock.
+struct AecWatchCounts {
+    uint32_t rx_frames = 0;
+    uint32_t tx_frames = 0;
+    uint64_t left_square = 0;
+    uint64_t right_square = 0;
+    uint64_t tx_square = 0;
+};
+AecWatchCounts g_aec_watch_counts;
 #endif
 #if CONFIG_RESPEAKER_I2S_EXTERNAL_CLOCK_48K
 constexpr int kAudioSampleRate = 48000;
@@ -486,6 +502,14 @@ private:
                  kEchoGuardPolls, static_cast<long long>(kEchoGuardWindowUs / 1000));
 #endif
 
+#if CONFIG_RESPEAKER_XVF3800_AEC_WATCH
+        ESP_LOGI(kTag,
+                 "XVF3800 aec watch: reboot the XMOS when right / playback stays >= %g over %d s of playback, "
+                 "at most %d times a day, then ask for a power cycle",
+                 static_cast<double>(strtof(CONFIG_RESPEAKER_XVF3800_AEC_WATCH_RATIO, nullptr)),
+                 CONFIG_RESPEAKER_XVF3800_AEC_WATCH_WINDOWS, CONFIG_RESPEAKER_XVF3800_AEC_WATCH_MAX_REBOOTS);
+#endif
+
         auto& app = Application::GetInstance();
         while (true) {
             vTaskDelay(pdMS_TO_TICKS(CONFIG_RESPEAKER_XVF3800_CONTROL_POLL_MS));
@@ -494,6 +518,11 @@ private:
 #endif
             const int64_t now = esp_timer_get_time();
             const bool speaking = app.GetDeviceState() == kDeviceStateSpeaking;
+#if CONFIG_RESPEAKER_XVF3800_AEC_WATCH
+            if (AecWatchTick(now, speaking)) {
+                continue;  // the XMOS was rebooted, which took seconds: start over with fresh values
+            }
+#endif
 #if CONFIG_RESPEAKER_XVF3800_BARGE_IN
             portENTER_CRITICAL(&g_input_shape_lock);
             const InputShape shape = g_input_shape;
@@ -775,6 +804,78 @@ private:
         }
     }
 
+#if CONFIG_RESPEAKER_XVF3800_AEC_WATCH
+    // Once a second: feed the watch. Reboots the XMOS when the watch asks for it and the device has
+    // not played anything for a while (GPT-Live splits a reply at 0.7 s of silence). Returns true
+    // if it rebooted. A failed reboot only costs an attempt: the watch counts it and then gives up.
+    bool AecWatchTick(int64_t now, bool speaking) {
+        auto& app = Application::GetInstance();
+        if (speaking) {
+            aec_last_speaking_us_ = now;
+        }
+        if (now - aec_last_second_us_ >= 1000000) {
+            aec_last_second_us_ = now;
+            portENTER_CRITICAL(&g_input_shape_lock);
+            const AecWatchCounts counts = g_aec_watch_counts;
+            g_aec_watch_counts = AecWatchCounts{};
+            portEXIT_CRITICAL(&g_input_shape_lock);
+            const auto rms = [](uint64_t square, uint32_t frames) {
+                return frames == 0 ? 0U : static_cast<uint32_t>(std::sqrt(static_cast<double>(square) / frames));
+            };
+            const uint32_t seen_before = aec_watch_.seconds_seen();
+            const auto event = aec_watch_.AddSecond(rms(counts.left_square, counts.rx_frames),
+                                                    rms(counts.right_square, counts.rx_frames),
+                                                    rms(counts.tx_square, counts.tx_frames),
+                                                    counts.tx_frames >= kAudioSampleRate * 3 / 4, now / 1000000);
+            const auto median = static_cast<double>(aec_watch_.Median());
+            if (aec_watch_.seconds_seen() != seen_before &&
+                aec_watch_.seconds_seen() % CONFIG_RESPEAKER_XVF3800_AEC_WATCH_WINDOWS == 0) {
+                ESP_LOGI(kTag, "XVF3800 aec watch: right / playback median %.3f over %d s of playback", median,
+                         aec_watch_.count());
+            }
+            switch (event) {
+                case AecWatch::Event::kBroken:
+                    ESP_LOGW(kTag, "XVF3800 aec watch: median %.3f, the echo canceller looks broken", median);
+                    break;
+                case AecWatch::Event::kRebootFailed:
+                    ESP_LOGW(kTag, "XVF3800 aec watch: median %.3f, the reboot did not help", median);
+                    break;
+                case AecWatch::Event::kRecovered:
+                    ESP_LOGW(kTag, "XVF3800 aec watch: median %.3f, recovered", median);
+                    break;
+                case AecWatch::Event::kNeedsPowerCycle:
+                    ESP_LOGW(kTag, "XVF3800 aec watch: median %.3f after %d reboots today, needs a power cycle", median,
+                             aec_watch_.RebootsInLastDay(now / 1000000));
+                    aec_told_this_session_ = false;
+                    break;
+                case AecWatch::Event::kNone:
+                    break;
+            }
+        }
+        const auto state = app.GetDeviceState();
+        if (state != kDeviceStateListening && state != kDeviceStateSpeaking) {
+            aec_told_this_session_ = false;
+        } else if (aec_watch_.needs_power_cycle() && !aec_told_this_session_) {
+            // The server says it aloud: the loudspeaker still works, and only a person can help.
+            aec_told_this_session_ = true;
+            char payload[128];
+            snprintf(payload, sizeof(payload),
+                     "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/device_health\","
+                     "\"params\":{\"aec\":\"needs_power_cycle\",\"median\":%.2f}}",
+                     static_cast<double>(aec_watch_.Median()));
+            app.SendMcpMessage(payload);
+            ESP_LOGW(kTag, "XVF3800 aec watch: told the server that a power cycle is needed");
+        }
+        if (aec_watch_.reboot_wanted() && !speaking && now - aec_last_speaking_us_ >= kAecWatchQuietUs) {
+            ESP_LOGW(kTag, "XVF3800 aec watch: rebooting the XMOS (reboot %d today)",
+                     aec_watch_.RebootsInLastDay(now / 1000000) + 1);
+            RebootXmos();
+            return true;
+        }
+        return false;
+    }
+#endif
+
     void Report(bool speaking, const float* energy, uint32_t input_rms) {
         uint16_t doa[2] = {};
         const bool doa_ok = doa_cmd_ != 0 &&
@@ -995,9 +1096,18 @@ private:
                  "XVF3800 echo guard: %d replies in a row started with input rms > %d; the echo "
                  "canceller looks diverged, rebooting the XMOS",
                  CONFIG_RESPEAKER_XVF3800_ECHO_GUARD_REPLIES, CONFIG_RESPEAKER_XVF3800_ECHO_GUARD_RMS);
+        RebootXmos();
+    }
+#endif
+
+#if CONFIG_RESPEAKER_XVF3800_ECHO_GUARD || CONFIG_RESPEAKER_XVF3800_AEC_WATCH
+    void RebootXmos() {
+#if CONFIG_RESPEAKER_XVF3800_AEC_WATCH
+        aec_watch_.OnReboot(esp_timer_get_time() / 1000000);
+#endif
         const uint8_t any = 1;
         if (!control_.Write(Xvf3800Control::kResApp, Xvf3800Control::kCmdReboot, &any, sizeof(any))) {
-            ESP_LOGW(kTag, "XVF3800 echo guard: REBOOT write failed");
+            ESP_LOGW(kTag, "XVF3800 reboot: REBOOT write failed");
             return;
         }
         // Same allowance as at power-up, then wait for the application servicer to answer.
@@ -1012,10 +1122,10 @@ private:
             }
         }
         if (!back) {
-            ESP_LOGW(kTag, "XVF3800 echo guard: XMOS does not answer after the reboot");
+            ESP_LOGW(kTag, "XVF3800 reboot: XMOS does not answer after the reboot");
             return;
         }
-        ESP_LOGI(kTag, "XVF3800 echo guard: XMOS back (v%u.%u.%u), writing the overrides again",
+        ESP_LOGI(kTag, "XVF3800 reboot: XMOS back (v%u.%u.%u), writing the overrides again",
                  version[0], version[1], version[2]);
         ApplyOverrides();
     }
@@ -1044,6 +1154,16 @@ private:
     int reply_loud_polls_ = 0;  // polls above ECHO_GUARD_RMS in the current reply's start
     int echo_replies_ = 0;      // consecutive replies that started that loud
     int64_t last_reboot_us_ = -kEchoGuardCooldownUs;
+#endif
+#if CONFIG_RESPEAKER_XVF3800_AEC_WATCH
+    static constexpr int64_t kAecWatchQuietUs = 5000000;
+    AecWatch aec_watch_{AecWatch::Config{
+        strtof(CONFIG_RESPEAKER_XVF3800_AEC_WATCH_RATIO, nullptr), CONFIG_RESPEAKER_XVF3800_AEC_WATCH_WINDOWS,
+        CONFIG_RESPEAKER_XVF3800_AEC_WATCH_WINDOWS / 2, CONFIG_RESPEAKER_XVF3800_AEC_WATCH_VERIFY_S,
+        CONFIG_RESPEAKER_XVF3800_AEC_WATCH_MAX_REBOOTS}};
+    int64_t aec_last_second_us_ = 0;
+    int64_t aec_last_speaking_us_ = 0;
+    bool aec_told_this_session_ = false;
 #endif
     int64_t last_report_us_ = 0;
     bool armed_ = true;
@@ -1204,6 +1324,9 @@ private:
 
             const size_t frames = bytes_read / (2 * sizeof(int32_t));
             uint64_t square_sum = 0;
+#if CONFIG_RESPEAKER_XVF3800_AEC_WATCH
+            uint64_t right_square_sum = 0;
+#endif
 #if CONFIG_RESPEAKER_XVF3800_BARGE_IN
             uint64_t diff_square_sum = 0;
             uint32_t peak = 0;
@@ -1221,6 +1344,10 @@ private:
                 peak = std::max(peak, static_cast<uint32_t>(value < 0 ? -value : value));
                 crossings += (value < 0) != (previous < 0);
                 previous = value;
+#endif
+#if CONFIG_RESPEAKER_XVF3800_AEC_WATCH
+                const int32_t right16 = rx_buffer_[i * 2 + 1] >> 16;
+                right_square_sum += static_cast<uint64_t>(static_cast<int64_t>(right16) * right16);
 #endif
 #if CONFIG_RESPEAKER_AUDIO_DIAGNOSTICS
                 const int32_t right = rx_buffer_[i * 2 + 1];
@@ -1251,6 +1378,11 @@ private:
                 shape.crossings += crossings;
                 shape.square_sum += square_sum;
                 shape.diff_square_sum += diff_square_sum;
+#if CONFIG_RESPEAKER_XVF3800_AEC_WATCH
+                g_aec_watch_counts.rx_frames += static_cast<uint32_t>(frames);
+                g_aec_watch_counts.left_square += square_sum;
+                g_aec_watch_counts.right_square += right_square_sum;
+#endif
                 for (size_t done = 0; done < frames;) {
                     const size_t count =
                         std::min(frames - done, static_cast<size_t>(kInputRingSamples - g_input_ring_pos));
@@ -1277,6 +1409,9 @@ private:
             // the barge-in monitor is ramped over one DMA chunk instead of stepped.
             const int32_t duck = g_output_duck_q16.load(std::memory_order_relaxed);
             const int ramp = duck == duck_applied_q16_ ? 0 : std::min(samples, AUDIO_CODEC_DMA_FRAME_NUM);
+#if CONFIG_RESPEAKER_XVF3800_AEC_WATCH
+            uint64_t tx_square_sum = 0;
+#endif
 
             for (int i = 0; i < samples; ++i) {
                 const int64_t gain =
@@ -1287,8 +1422,18 @@ private:
                     static_cast<int32_t>(std::clamp<int64_t>(scaled, INT32_MIN, INT32_MAX));
                 tx_buffer_[static_cast<size_t>(i) * 2] = sample;
                 tx_buffer_[static_cast<size_t>(i) * 2 + 1] = sample;
+#if CONFIG_RESPEAKER_XVF3800_AEC_WATCH
+                const int32_t tx16 = sample >> 16;
+                tx_square_sum += static_cast<uint64_t>(static_cast<int64_t>(tx16) * tx16);
+#endif
             }
             duck_applied_q16_ = duck;
+#if CONFIG_RESPEAKER_XVF3800_AEC_WATCH
+            portENTER_CRITICAL(&g_input_shape_lock);
+            g_aec_watch_counts.tx_frames += static_cast<uint32_t>(samples);
+            g_aec_watch_counts.tx_square += tx_square_sum;
+            portEXIT_CRITICAL(&g_input_shape_lock);
+#endif
 
             constexpr size_t kFrameBytes = 2 * sizeof(int32_t);
             constexpr size_t kChunkBytes = AUDIO_CODEC_DMA_FRAME_NUM * kFrameBytes;
